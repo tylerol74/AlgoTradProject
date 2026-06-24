@@ -9,7 +9,12 @@ from typing import List, Optional
 from backtesting.engine import run_backtest
 from backtesting.models import BacktestConfig
 from config.settings import DEFAULT_TEST_TICKERS, LOG_LEVEL
+from configurations.models import GrahamStrategyConfig, UniverseConfig
+from configurations.presets import get_preset, list_presets
+from configurations.serialization import config_from_json, config_to_json
+from configurations.validation import ConfigurationValidationError
 from data.market_data import update_price_universe
+from data import strategy_data as repository_strategy_data
 from database.repositories import (
     get_backtest_run,
     get_backtest_trades,
@@ -29,7 +34,21 @@ from fundamentals.service import (
 from reporting.backtest_report import create_backtest_report
 from reporting.comparison import compare_backtests
 from reporting.exports import export_backtest_report, export_comparison, export_experiment
+from reporting.graham_report import export_graham_evaluations, graham_evaluation_to_dict, graham_summary_row
+from strategies.graham_value import GrahamValueStrategy
 from strategies.moving_average_reversion import MovingAverageReversionStrategy
+
+
+def _add_graham_threshold_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--minimum-margin-of-safety", type=float, default=0.30)
+    parser.add_argument("--minimum-graham-score", type=float, default=70.0)
+    parser.add_argument("--minimum-data-quality-score", type=float, default=60.0)
+    parser.add_argument("--minimum-profitable-years", type=int, default=4)
+    parser.add_argument("--minimum-price", type=float, default=3.0)
+    parser.add_argument("--minimum-market-cap", type=float, default=300_000_000.0)
+    parser.add_argument("--minimum-average-dollar-volume", type=float, default=2_000_000.0)
+    parser.add_argument("--exclude-financials", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--exclude-reits", action=argparse.BooleanOptionalAction, default=True)
 
 
 def configure_logging() -> None:
@@ -114,6 +133,48 @@ def build_parser() -> argparse.ArgumentParser:
     show_fundamentals_parser = subparsers.add_parser("show-fundamentals", help="Show point-in-time fundamentals")
     show_fundamentals_parser.add_argument("ticker")
     show_fundamentals_parser.add_argument("--as-of", required=True)
+
+    evaluate_graham = subparsers.add_parser("evaluate-graham", help="Evaluate one Graham candidate")
+    evaluate_graham.add_argument("ticker")
+    evaluate_graham.add_argument("--as-of", required=True)
+    _add_graham_threshold_flags(evaluate_graham)
+    evaluate_graham.add_argument("--json", action="store_true")
+    evaluate_graham.add_argument("--export-dir", default=None)
+
+    screen_graham = subparsers.add_parser("screen-graham", help="Screen multiple Graham candidates")
+    screen_graham.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
+    screen_graham.add_argument("--as-of", required=True)
+    _add_graham_threshold_flags(screen_graham)
+    screen_graham.add_argument("--json", action="store_true")
+    screen_graham.add_argument("--export-dir", default=None)
+
+    graham_backtest = subparsers.add_parser("run-graham-backtest", help="Run the standalone Graham backtest")
+    graham_backtest.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
+    graham_backtest.add_argument("--start-date", required=True)
+    graham_backtest.add_argument("--end-date", required=True)
+    graham_backtest.add_argument("--starting-capital", type=float, default=100000.0)
+    graham_backtest.add_argument("--maximum-positions", type=int, default=10)
+    graham_backtest.add_argument("--position-size-pct", type=float, default=0.10)
+    graham_backtest.add_argument("--slippage-pct", type=float, default=0.001)
+    graham_backtest.add_argument("--commission", type=float, default=0.0)
+    _add_graham_threshold_flags(graham_backtest)
+    graham_backtest.add_argument("--maximum-holding-days", type=int, default=504)
+    graham_backtest.add_argument("--stop-loss-pct", type=float, default=None)
+    graham_backtest.add_argument("--reevaluation-frequency", default="weekly")
+    graham_backtest.add_argument("--benchmark", default=None)
+    graham_backtest.add_argument("--no-persist", action="store_true")
+
+    subparsers.add_parser("list-strategy-presets", help="List built-in strategy presets")
+
+    show_preset = subparsers.add_parser("show-strategy-preset", help="Show one strategy preset as JSON")
+    show_preset.add_argument("name")
+
+    export_preset = subparsers.add_parser("export-strategy-preset", help="Export one strategy preset to JSON")
+    export_preset.add_argument("name")
+    export_preset.add_argument("--output", required=True)
+
+    validate_config = subparsers.add_parser("validate-strategy-config", help="Validate a strategy configuration JSON file")
+    validate_config.add_argument("path")
 
     subparsers.add_parser("db-status", help="Show SQLite database status")
     parser.set_defaults(command="init-db")
@@ -334,6 +395,135 @@ def _show_fundamentals_command(args: argparse.Namespace) -> None:
         )
 
 
+def _graham_strategy(args: argparse.Namespace) -> GrahamValueStrategy:
+    strategy_config = GrahamStrategyConfig(
+        minimum_margin_of_safety=args.minimum_margin_of_safety,
+        minimum_graham_score=args.minimum_graham_score,
+        minimum_data_quality_score=args.minimum_data_quality_score,
+        minimum_profitable_years=args.minimum_profitable_years,
+        exclude_financials=args.exclude_financials,
+        exclude_reits=args.exclude_reits,
+    )
+    universe_config = UniverseConfig(
+        minimum_price=args.minimum_price,
+        minimum_market_cap=args.minimum_market_cap,
+        minimum_average_dollar_volume=args.minimum_average_dollar_volume,
+    )
+    return GrahamValueStrategy(
+        strategy_config=strategy_config,
+        universe_config=universe_config,
+        maximum_holding_days=getattr(args, "maximum_holding_days", 504),
+        stop_loss_pct=getattr(args, "stop_loss_pct", None),
+        reevaluation_frequency=getattr(args, "reevaluation_frequency", "weekly"),
+        strategy_data=repository_strategy_data,
+    )
+
+
+def _evaluate_graham_command(args: argparse.Namespace) -> None:
+    strategy = _graham_strategy(args)
+    try:
+        evaluation = strategy.evaluate(args.ticker, args.as_of)
+    except Exception as exc:
+        print(f"Graham evaluation failed: {exc}")
+        print("If data is missing, run update-prices and update-fundamentals first.")
+        return
+    if args.json:
+        print(json.dumps(graham_evaluation_to_dict(evaluation), indent=2, sort_keys=True, default=str))
+    else:
+        row = graham_summary_row(evaluation)
+        print(f"{row['ticker']} as of {row['evaluation_date']}")
+        print(f"Price: {row['price']}")
+        print(f"EPS: {row['eps']}")
+        print(f"Book value/share: {row['book_value_per_share']}")
+        print(f"Graham Number: {row['graham_number']}")
+        print(f"Margin of safety: {row['margin_of_safety']}")
+        print(f"Graham score: {row['graham_quality_score']}")
+        print(f"Data-quality score: {row['data_quality_score']}")
+        print(f"Classification: {row['classification']}")
+        print(f"Qualification: {row['qualification_status']}")
+        print(f"Signal: {row['signal_type']}")
+        print(f"Disqualifications: {row['disqualification_reasons'] or '(none)'}")
+        print(f"Warnings: {row['warnings'] or '(none)'}")
+    if args.export_dir:
+        for path in export_graham_evaluations([evaluation], args.export_dir, f"graham-{evaluation.ticker}-{evaluation.evaluation_date}.json"):
+            print(f"Exported {path}")
+
+
+def _screen_graham_command(args: argparse.Namespace) -> None:
+    strategy = _graham_strategy(args)
+    evaluations = [strategy.evaluate(ticker, args.as_of) for ticker in args.tickers]
+    rows = [graham_summary_row(evaluation) for evaluation in evaluations]
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+    else:
+        for row in rows:
+            print(
+                f"{row['ticker']} price={row['price']} eps={row['eps']} bvps={row['book_value_per_share']} "
+                f"graham={row['graham_number']} mos={row['margin_of_safety']} score={row['graham_quality_score']} "
+                f"dq={row['data_quality_score']} class={row['classification']} status={row['qualification_status']} "
+                f"reasons={row['disqualification_reasons'] or '(none)'}"
+            )
+    if args.export_dir:
+        for path in export_graham_evaluations(evaluations, args.export_dir):
+            print(f"Exported {path}")
+
+
+def _run_graham_backtest_command(args: argparse.Namespace) -> None:
+    config = BacktestConfig(
+        "graham_value_v1",
+        args.tickers,
+        args.start_date,
+        args.end_date,
+        args.starting_capital,
+        args.maximum_positions,
+        args.position_size_pct,
+        args.slippage_pct,
+        args.commission,
+        args.maximum_holding_days,
+    )
+    strategy = _graham_strategy(args)
+    try:
+        result = run_backtest(config, strategy, benchmark_ticker=args.benchmark, persist=not args.no_persist)
+    except ValueError as exc:
+        print(f"Graham backtest failed: {exc}")
+        print("Run update-prices and update-fundamentals before running Graham backtests.")
+        return
+    _print_backtest_result(result)
+
+
+def _list_strategy_presets_command() -> None:
+    for name in list_presets():
+        print(name)
+
+
+def _show_strategy_preset_command(args: argparse.Namespace) -> None:
+    try:
+        print(config_to_json(get_preset(args.name)))
+    except ValueError as exc:
+        print(str(exc))
+
+
+def _export_strategy_preset_command(args: argparse.Namespace) -> None:
+    try:
+        preset = get_preset(args.name)
+        Path(args.output).write_text(config_to_json(preset), encoding="utf-8")
+    except (ValueError, ConfigurationValidationError) as exc:
+        print(f"Export failed: {exc}")
+        return
+    print(f"Exported {args.name} to {args.output}")
+
+
+def _validate_strategy_config_command(args: argparse.Namespace) -> None:
+    try:
+        config_from_json(Path(args.path).read_text(encoding="utf-8"))
+    except ConfigurationValidationError as exc:
+        print("Invalid strategy configuration:")
+        for error in exc.errors:
+            print(f"  {error.field}: {error.message}")
+        return
+    print("Strategy configuration is valid.")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     """Run the command-line interface."""
     configure_logging()
@@ -365,6 +555,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         _show_filings_command(args)
     elif args.command == "show-fundamentals":
         _show_fundamentals_command(args)
+    elif args.command == "evaluate-graham":
+        _evaluate_graham_command(args)
+    elif args.command == "screen-graham":
+        _screen_graham_command(args)
+    elif args.command == "run-graham-backtest":
+        _run_graham_backtest_command(args)
+    elif args.command == "list-strategy-presets":
+        _list_strategy_presets_command()
+    elif args.command == "show-strategy-preset":
+        _show_strategy_preset_command(args)
+    elif args.command == "export-strategy-preset":
+        _export_strategy_preset_command(args)
+    elif args.command == "validate-strategy-config":
+        _validate_strategy_config_command(args)
     elif args.command == "db-status":
         _print_db_status()
 

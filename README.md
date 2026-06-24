@@ -328,6 +328,166 @@ If an invalid ticker fails, continue using `db-status` and `show-prices` to insp
 
 All future strategy and backtesting modules should read price history from SQLite through repository functions rather than making their own yfinance calls.
 
+## Phase 4B Graham Value Backend
+
+Phase 4B adds a standalone, point-in-time Graham Value Baseline backend. It evaluates common-stock candidates using stored historical prices and stored SEC fundamentals only; it does not call SEC EDGAR or yfinance during evaluation, screening, or Graham backtesting.
+
+The primary Graham Number formula is:
+
+```text
+Graham Number = sqrt(22.5 * EPS * book value per share)
+```
+
+EPS selection is point-in-time and uses this hierarchy:
+
+1. trailing-twelve-month diluted EPS when it can be constructed safely
+2. latest annual diluted EPS
+3. trailing-twelve-month basic EPS when it can be constructed safely
+4. latest annual basic EPS
+
+The current implementation avoids unsafe TTM construction and falls back to reliable annual EPS with data-quality penalties. Historical shares are selected without present-day leakage: latest point-in-time shares outstanding first, then weighted-average diluted shares, then weighted-average basic shares, otherwise no share value with an explicit warning.
+
+Book value per share is common shareholders' equity divided by point-in-time shares. Preferred equity is subtracted when available. Tangible book value subtracts goodwill and intangible assets only when those values are explicitly known.
+
+Point-in-time rules are mandatory:
+
+- use facts from filings accepted on or before the evaluation date
+- use filing date only as a documented fallback when `accepted_at` is missing
+- preserve amendment timing
+- exclude future filings and current-share leakage
+- never mutate stored price or fundamental records during evaluation
+
+## Graham Scoring and Disqualification
+
+The transparent Graham score is 0 to 100:
+
+- valuation: 40 points
+- financial strength: 25 points
+- earnings quality: 20 points
+- tradability: 10 points
+- data quality: 5 points
+
+Data-quality scores are also 0 to 100:
+
+- 90-100: High confidence
+- 75-89: Good
+- 60-74: Usable with warnings
+- 40-59: Low confidence
+- below 40: Insufficient
+
+Hard disqualifications are returned individually. They include price below the configured minimum, insufficient average dollar volume, insufficient market cap, missing usable filing data, non-positive EPS, non-positive book value per share, non-positive common equity, two consecutive annual losses, low data quality, low margin of safety, low Graham score, insufficient profitable years, excluded financial companies, excluded REITs, unsupported security types, and evidence of future-data leakage.
+
+Graham Number is a screening estimate, not guaranteed intrinsic value. The strategy is intentionally conservative and should not be optimized blindly to past results.
+
+## Graham Configuration
+
+Reusable configuration models live in `configurations/`. They use typed dataclasses and deterministic JSON serialization so a future UI can control strategy criteria without hard-coded thresholds.
+
+Initial configurable fields:
+
+- Strategy: margin of safety, Graham score, data-quality score, profitable years, financial exclusion, REIT exclusion
+- Universe: minimum price, market cap, average dollar volume, tickers
+- Portfolio: starting capital, maximum positions, position size
+- Execution: slippage, commission, execution timing
+- Backtest: start date, end date, benchmark
+
+Example JSON:
+
+```json
+{
+  "backtest": {
+    "benchmark": "AAPL",
+    "end_date": "2025-12-31",
+    "start_date": "2025-01-01"
+  },
+  "config_version": 1,
+  "description": "Baseline Graham screen",
+  "execution": {
+    "commission": 0.0,
+    "execution_timing": "next_open",
+    "slippage_pct": 0.001
+  },
+  "name": "Moderate Graham",
+  "portfolio": {
+    "maximum_positions": 10,
+    "position_size_pct": 0.1,
+    "starting_capital": 100000.0
+  },
+  "strategy": {
+    "exclude_financials": true,
+    "exclude_reits": true,
+    "minimum_data_quality_score": 60.0,
+    "minimum_graham_score": 70.0,
+    "minimum_margin_of_safety": 0.3,
+    "minimum_profitable_years": 4
+  },
+  "strategy_type": "graham_value_v1",
+  "universe": {
+    "minimum_average_dollar_volume": 2000000.0,
+    "minimum_market_cap": 300000000.0,
+    "minimum_price": 3.0,
+    "tickers": ["AAPL", "MSFT"]
+  }
+}
+```
+
+Validation rejects unknown fields, duplicate normalized tickers, unsupported versions, unsupported strategy types, invalid execution timing, invalid ranges, and invalid date ordering. Missing optional nested fields use documented defaults.
+
+Built-in presets:
+
+- Moderate Graham
+- Strict Graham
+- Large-Cap Quality Value
+
+## Graham CLI
+
+Evaluate one ticker:
+
+```powershell
+python main.py evaluate-graham AAPL --as-of 2025-06-01
+```
+
+Screen a ticker list:
+
+```powershell
+python main.py screen-graham --tickers AAPL MSFT KO F INTC --as-of 2025-06-01
+```
+
+Run a standalone Graham backtest using next-open execution:
+
+```powershell
+python main.py run-graham-backtest --tickers AAPL MSFT KO F INTC --start-date 2024-01-01 --end-date 2025-06-01
+```
+
+Configurable CLI thresholds include:
+
+```powershell
+--minimum-margin-of-safety 0.30
+--minimum-graham-score 70
+--minimum-data-quality-score 60
+--minimum-profitable-years 4
+--minimum-price 3
+--minimum-market-cap 300000000
+--minimum-average-dollar-volume 2000000
+--exclude-financials
+--exclude-reits
+```
+
+Preset and configuration commands:
+
+```powershell
+python main.py list-strategy-presets
+python main.py show-strategy-preset "Moderate Graham"
+python main.py export-strategy-preset "Moderate Graham" --output moderate-graham.json
+python main.py validate-strategy-config moderate-graham.json
+```
+
+## Graham Limitations
+
+Version 1 excludes financial companies and REITs by default. It does not support brokerage integration, Streamlit, paper trading, options, short selling, leverage, machine learning, automated parameter optimization, intraday trading, financial-sector valuation, REIT valuation, warrants, preferred-share valuation, or Graham plus technical combined strategies.
+
+The future UI should use the backend configuration models rather than duplicating Graham thresholds.
+
 
 
 
