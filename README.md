@@ -345,7 +345,26 @@ EPS selection is point-in-time and uses this hierarchy:
 3. trailing-twelve-month basic EPS when it can be constructed safely
 4. latest annual basic EPS
 
-The current implementation avoids unsafe TTM construction and falls back to reliable annual EPS with data-quality penalties. Historical shares are selected without present-day leakage: latest point-in-time shares outstanding first, then weighted-average diluted shares, then weighted-average basic shares, otherwise no share value with an explicit warning.
+Safe TTM EPS is used only when exactly four completed, non-overlapping, non-duplicate quarterly periods are visible as of the evaluation date. The periods must have valid start/end dates, consistent EPS concept and unit, consistent diluted or basic method, compatible fiscal-year and fiscal-period metadata, filing acceptance on or before the evaluation date, source accession numbers, and no annual or YTD value silently mixed in as a quarter. Fiscal quarters are matched from SEC fiscal-year and fiscal-period metadata where available, so non-calendar fiscal years are supported and calendar month labels are not the authority.
+
+Standalone quarters may be derived from year-to-date facts only when the math is provable:
+
+- Q2 standalone = six-month YTD minus Q1
+- Q3 standalone = nine-month YTD minus six-month YTD
+- Q4 standalone = annual EPS minus nine-month YTD
+
+Those derivations require exact period alignment, consistent concept and units, matching fiscal-year boundaries, no conflicting selected amended fact, and all source filings accepted by the evaluation date. Unsafe TTM construction is rejected. When TTM is rejected, the strategy falls back to the latest reliable annual EPS in the documented hierarchy and preserves the rejected TTM reasons, source periods, accepted timestamps, forms, accession numbers, amendment flags, direct versus derived period counts, and warnings.
+
+Amendment handling is availability-aware: original filings remain selected before an amendment acceptance timestamp, and amended facts become selectable only after the amendment is public. Amendments are not applied retroactively.
+
+Historical shares are selected without present-day leakage:
+
+1. latest valid instant shares-outstanding fact available as of the evaluation date
+2. weighted-average diluted shares matching the selected EPS period
+3. weighted-average basic shares matching the selected EPS period
+4. no share value, with an explicit warning
+
+Zero, negative, NaN, and infinite share counts are rejected. Weighted-average substitutions are warned, filing metadata is retained, and large instant-versus-weighted-average inconsistencies are surfaced as possible split-adjustment warnings. The code does not silently repair split inconsistencies.
 
 Book value per share is common shareholders' equity divided by point-in-time shares. Preferred equity is subtracted when available. Tangible book value subtracts goodwill and intangible assets only when those values are explicitly known.
 
@@ -357,7 +376,9 @@ Point-in-time rules are mandatory:
 - exclude future filings and current-share leakage
 - never mutate stored price or fundamental records during evaluation
 
-## Graham Scoring and Disqualification
+## Graham Data Quality and Scoring
+
+Data-quality diagnostics are visible penalties, not a hidden number. Each penalty includes a code, point deduction, affected field, explanation, and source metadata where relevant. The score is `100 - visible penalties`, bounded to 0-100. Penalties cover accepted timestamp gaps, filing-date fallback, annual/basic EPS fallback, share fallback or missing shares, missing preferred equity, missing current assets or liabilities, missing debt, missing goodwill or intangibles, incomplete five-year earnings history, and possible future-data issues.
 
 The transparent Graham score is 0 to 100:
 
@@ -453,6 +474,16 @@ Screen a ticker list:
 python main.py screen-graham --tickers AAPL MSFT KO F INTC --as-of 2025-06-01
 ```
 
+Audit stored Graham data coverage without downloading or mutating price/fundamental tables:
+
+```powershell
+python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-01
+python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-01 --json
+python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-01 --export-dir .\reports
+```
+
+The audit output includes one row per ticker with price, EPS, shares, equity, current assets, current liabilities, debt availability, EPS and share methods, five-year earnings-history count, data-quality score, Graham-ready status, primary missing reason, and warning count. It clearly distinguishes missing data from failed eligibility rules.
+
 Run a standalone Graham backtest using next-open execution:
 
 ```powershell
@@ -485,6 +516,8 @@ python main.py validate-strategy-config moderate-graham.json
 ## Graham Limitations
 
 Version 1 excludes financial companies and REITs by default. It does not support brokerage integration, Streamlit, paper trading, options, short selling, leverage, machine learning, automated parameter optimization, intraday trading, financial-sector valuation, REIT valuation, warrants, preferred-share valuation, or Graham plus technical combined strategies.
+
+SEC company facts vary by issuer. Some companies report unusual concepts, restatements, fiscal calendars, 52/53-week years, missing preferred equity, incomplete goodwill or intangible detail, or YTD-only interim facts. The Graham backend rejects unsafe TTM EPS construction instead of guessing, and it reports warnings or data-quality penalties when issuer facts are incomplete or ambiguous.
 
 The future UI should use the backend configuration models rather than duplicating Graham thresholds.
 
