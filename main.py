@@ -34,7 +34,7 @@ from fundamentals.service import (
 from reporting.backtest_report import create_backtest_report
 from reporting.comparison import compare_backtests
 from reporting.exports import export_backtest_report, export_comparison, export_experiment
-from reporting.graham_report import export_graham_evaluations, graham_evaluation_to_dict, graham_summary_row
+from reporting.graham_report import export_graham_evaluations, graham_audit_row, graham_evaluation_to_dict, graham_summary_row
 from strategies.graham_value import GrahamValueStrategy
 from strategies.moving_average_reversion import MovingAverageReversionStrategy
 
@@ -147,6 +147,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_graham_threshold_flags(screen_graham)
     screen_graham.add_argument("--json", action="store_true")
     screen_graham.add_argument("--export-dir", default=None)
+
+    audit_graham = subparsers.add_parser("audit-graham-data", help="Audit stored Graham data coverage without downloading")
+    audit_graham.add_argument("--tickers", nargs="+", required=True)
+    audit_graham.add_argument("--as-of", required=True)
+    _add_graham_threshold_flags(audit_graham)
+    audit_graham.add_argument("--json", action="store_true")
+    audit_graham.add_argument("--export-dir", default=None)
 
     graham_backtest = subparsers.add_parser("run-graham-backtest", help="Run the standalone Graham backtest")
     graham_backtest.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
@@ -468,6 +475,40 @@ def _screen_graham_command(args: argparse.Namespace) -> None:
             print(f"Exported {path}")
 
 
+def _audit_graham_data_command(args: argparse.Namespace) -> None:
+    strategy = _graham_strategy(args)
+    rows = [graham_audit_row(strategy.evaluate(ticker, args.as_of)) for ticker in args.tickers]
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+    else:
+        headers = [
+            "ticker",
+            "price_available",
+            "eps_available",
+            "eps_method",
+            "shares_available",
+            "shares_method",
+            "equity_available",
+            "current_assets_available",
+            "current_liabilities_available",
+            "debt_available",
+            "five_year_earnings_history_count",
+            "data_quality_score",
+            "graham_ready",
+            "primary_missing_reason",
+            "warning_count",
+        ]
+        print("\t".join(headers))
+        for row in rows:
+            print("\t".join(str(row.get(header, "")) for header in headers))
+    if args.export_dir:
+        directory = Path(args.export_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"graham-data-audit-{args.as_of}.json"
+        path.write_text(json.dumps(rows, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        print(f"Exported {path}")
+
+
 def _run_graham_backtest_command(args: argparse.Namespace) -> None:
     config = BacktestConfig(
         "graham_value_v1",
@@ -559,6 +600,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         _evaluate_graham_command(args)
     elif args.command == "screen-graham":
         _screen_graham_command(args)
+    elif args.command == "audit-graham-data":
+        _audit_graham_data_command(args)
     elif args.command == "run-graham-backtest":
         _run_graham_backtest_command(args)
     elif args.command == "list-strategy-presets":

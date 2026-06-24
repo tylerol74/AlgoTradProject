@@ -259,6 +259,9 @@ def get_fundamentals_as_of(ticker: str, as_of_date: str, period_type: str = "lat
                 "accepted_at_fallback_used": row.get("accepted_at") is None,
                 "concept": row.get("concept"),
                 "taxonomy": row.get("taxonomy"),
+                "fiscal_year": row.get("fiscal_year"),
+                "fiscal_period": row.get("fiscal_period"),
+                "selection_method": "latest available point-in-time fact",
             }
             for field, row in sorted(selected.items())
         },
