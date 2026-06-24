@@ -1,12 +1,12 @@
 ﻿# AlgoTradProject
 
-AlgoTradProject is a modular Python 3.9-compatible foundation for historical backtesting and eventual paper trading. The current phase builds one centralized historical market-data layer: daily OHLCV data is downloaded once, stored in SQLite, and future strategies/backtests should read from SQLite instead of calling Yahoo Finance directly.
+AlgoTradProject is a modular Python 3.9-compatible foundation for historical backtesting and eventual paper trading. The current phase adds a read-only strategy foundation on top of the centralized SQLite market-data layer. Daily OHLCV data is still downloaded once and stored in SQLite; strategies and indicators consume stored data only.
 
 Live brokerage integration, live trading, options, machine learning, dashboards, and full backtesting are intentionally not included yet.
 
 ## Current phase
 
-Phase 2: centralized historical market-data storage.
+Phase 3A: read-only strategy-data interface, standardized models, reusable technical indicators, and one diagnostic strategy.
 
 Included:
 
@@ -19,6 +19,11 @@ Included:
 - Validation for downloaded price rows
 - CLI commands for initialization, updates, price display, and database status
 - Pytest coverage with yfinance mocked for offline tests
+- Read-only strategy data access through repository functions
+- Standardized `Signal`, `Position`, `Trade`, and `BacktestConfig` dataclasses
+- `SignalAction` enum values: `BUY`, `SELL`, `HOLD`
+- Moving average and return indicators
+- Diagnostic moving-average reversion strategy that generates signals only
 
 ## Project structure
 
@@ -30,16 +35,29 @@ AlgoTradProject/
     data/
         __init__.py
         market_data.py
+        strategy_data.py
         validation.py
     database/
         __init__.py
         connection.py
         schema.py
         repositories.py
+    indicators/
+        __init__.py
+        moving_averages.py
+        returns.py
+    backtesting/
+        models.py
+    strategies/
+        base.py
+        moving_average_reversion.py
     tests/
         test_database.py
+        test_indicators.py
         test_market_data.py
+        test_moving_average_reversion.py
         test_repositories.py
+        test_strategy_data.py
     main.py
     requirements.txt
     README.md
@@ -155,3 +173,7 @@ Empty downloads can happen for invalid tickers, unsupported symbols, market holi
 If an invalid ticker fails, continue using `db-status` and `show-prices` to inspect any tickers that did update successfully.
 
 All future strategy and backtesting modules should read price history from SQLite through repository functions rather than making their own yfinance calls.
+
+
+
+

@@ -204,3 +204,85 @@ def get_database_status(database_path: Optional[DatabasePath] = None) -> Dict[st
         "latest_date": prices["latest_date"],
         "rows_by_ticker": {row["ticker"]: int(row["row_count"]) for row in by_ticker},
     }
+
+def get_available_tickers(database_path: Optional[DatabasePath] = None) -> List[str]:
+    """Return active tickers that have stored daily prices."""
+    with get_connection(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT ticker
+            FROM daily_prices
+            ORDER BY ticker
+            """
+        ).fetchall()
+    return [row["ticker"] for row in rows]
+
+
+def get_trading_dates(
+    tickers: Sequence[str],
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    database_path: Optional[DatabasePath] = None,
+) -> List[str]:
+    """Return distinct stored trading dates for one or more tickers."""
+    normalized = [ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()]
+    if not normalized:
+        return []
+
+    placeholders = ", ".join("?" for _ in normalized)
+    query = [
+        f"""
+        SELECT DISTINCT trade_date
+        FROM daily_prices
+        WHERE ticker IN ({placeholders})
+        """
+    ]
+    parameters: List[Any] = list(normalized)
+
+    if start_date:
+        query.append("AND trade_date >= ?")
+        parameters.append(start_date)
+    if end_date:
+        query.append("AND trade_date <= ?")
+        parameters.append(end_date)
+    query.append("ORDER BY trade_date")
+
+    with get_connection(database_path) as connection:
+        rows = connection.execute("\n".join(query), parameters).fetchall()
+    return [row["trade_date"] for row in rows]
+
+
+def get_price_on_date(
+    ticker: str,
+    trade_date: str,
+    database_path: Optional[DatabasePath] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return one stored price row for a ticker/date, if present."""
+    with get_connection(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT ticker, trade_date, open, high, low, close, adjusted_close, volume, downloaded_at
+            FROM daily_prices
+            WHERE ticker = ? AND trade_date = ?
+            """,
+            (ticker.strip().upper(), trade_date),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_next_trading_day(
+    ticker: str,
+    trade_date: str,
+    database_path: Optional[DatabasePath] = None,
+) -> Optional[str]:
+    """Return the next stored trading day after trade_date for a ticker."""
+    with get_connection(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT MIN(trade_date) AS next_date
+            FROM daily_prices
+            WHERE ticker = ? AND trade_date > ?
+            """,
+            (ticker.strip().upper(), trade_date),
+        ).fetchone()
+    return row["next_date"] if row and row["next_date"] else None
