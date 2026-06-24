@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+from pathlib import Path
 from typing import List, Optional
 
 from backtesting.engine import run_backtest
@@ -17,6 +18,11 @@ from database.repositories import (
     get_price_history,
 )
 from database.schema import initialize_database
+from experiments.models import experiment_config_from_dict
+from experiments.runner import experiment_summary, run_experiment
+from reporting.backtest_report import create_backtest_report
+from reporting.comparison import compare_backtests
+from reporting.exports import export_backtest_report, export_comparison, export_experiment
 from strategies.moving_average_reversion import MovingAverageReversionStrategy
 
 
@@ -36,16 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("init-db", help="Initialize the SQLite database")
 
     update_parser = subparsers.add_parser("update-prices", help="Download and store missing daily prices")
-    update_parser.add_argument("--tickers", nargs="+", default=None, help="Ticker symbols to update")
-    update_parser.add_argument("--start-date", default=None, help="Inclusive start date, YYYY-MM-DD")
-    update_parser.add_argument("--end-date", default=None, help="Inclusive end date, YYYY-MM-DD")
-    update_parser.add_argument("--batch-size", type=int, default=None, help="Progress batch size")
+    update_parser.add_argument("--tickers", nargs="+", default=None)
+    update_parser.add_argument("--start-date", default=None)
+    update_parser.add_argument("--end-date", default=None)
+    update_parser.add_argument("--batch-size", type=int, default=None)
 
     show_parser = subparsers.add_parser("show-prices", help="Show stored prices without downloading")
-    show_parser.add_argument("ticker", help="Ticker symbol to show")
-    show_parser.add_argument("--start-date", default=None, help="Inclusive start date, YYYY-MM-DD")
-    show_parser.add_argument("--end-date", default=None, help="Inclusive end date, YYYY-MM-DD")
-    show_parser.add_argument("--limit", type=int, default=10, help="Number of most recent rows to print")
+    show_parser.add_argument("ticker")
+    show_parser.add_argument("--start-date", default=None)
+    show_parser.add_argument("--end-date", default=None)
+    show_parser.add_argument("--limit", type=int, default=10)
 
     run_parser = subparsers.add_parser("run-backtest", help="Run the moving-average reversion backtest")
     run_parser.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
@@ -66,6 +72,24 @@ def build_parser() -> argparse.ArgumentParser:
     show_backtest = subparsers.add_parser("show-backtest", help="Show a saved backtest")
     show_backtest.add_argument("backtest_id", type=int)
 
+    report_parser = subparsers.add_parser("report-backtest", help="Analyze a saved backtest")
+    report_parser.add_argument("backtest_id", type=int)
+    report_parser.add_argument("--trades-limit", type=int, default=20)
+    report_parser.add_argument("--show-attribution", action="store_true")
+    report_parser.add_argument("--show-exit-reasons", action="store_true")
+    report_parser.add_argument("--show-monthly", action="store_true")
+    report_parser.add_argument("--export-dir", default=None)
+
+    compare_parser = subparsers.add_parser("compare-backtests", help="Compare saved backtests")
+    compare_parser.add_argument("backtest_ids", nargs="+", type=int)
+    compare_parser.add_argument("--sort-by", default=None)
+    compare_parser.add_argument("--descending", action="store_true")
+    compare_parser.add_argument("--export-dir", default=None)
+
+    experiment_parser = subparsers.add_parser("run-experiment", help="Run a JSON-defined development/validation experiment")
+    experiment_parser.add_argument("experiment_file")
+    experiment_parser.add_argument("--export-dir", default=None)
+
     subparsers.add_parser("db-status", help="Show SQLite database status")
     parser.set_defaults(command="init-db")
     return parser
@@ -79,31 +103,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def _print_update_summary(summary: dict) -> None:
     for item in summary["results"]:
         error = f" error={item['error']}" if item.get("error") else ""
-        print(
-            f"{item['ticker']}: {item['status']} "
-            f"downloaded={item['rows_downloaded']} stored={item['rows_stored']} "
-            f"start={item['start_date']} end={item['end_date']}{error}"
-        )
-    print(
-        "Total: "
-        f"updated={summary['updated']} already_current={summary['already_current']} "
-        f"no_data={summary['no_data']} failed={summary['failed']} "
-        f"downloaded={summary['rows_downloaded']} stored={summary['rows_stored']}"
-    )
+        print(f"{item['ticker']}: {item['status']} downloaded={item['rows_downloaded']} stored={item['rows_stored']} start={item['start_date']} end={item['end_date']}{error}")
+    print(f"Total: updated={summary['updated']} already_current={summary['already_current']} no_data={summary['no_data']} failed={summary['failed']} downloaded={summary['rows_downloaded']} stored={summary['rows_stored']}")
 
 
 def _show_prices(ticker: str, start_date: Optional[str], end_date: Optional[str], limit: int) -> None:
     rows = get_price_history(ticker, start_date=start_date, end_date=end_date)
-    rows_to_print = rows[-limit:]
-    if not rows_to_print:
+    if not rows:
         print(f"No stored prices found for {ticker.upper()}.")
         return
-    for row in rows_to_print:
-        print(
-            f"{row['trade_date']} {row['ticker']} "
-            f"O={row['open']:.2f} H={row['high']:.2f} L={row['low']:.2f} "
-            f"C={row['close']:.2f} AdjC={row['adjusted_close']:.2f} V={row['volume']}"
-        )
+    for row in rows[-limit:]:
+        print(f"{row['trade_date']} {row['ticker']} O={row['open']:.2f} H={row['high']:.2f} L={row['low']:.2f} C={row['close']:.2f} AdjC={row['adjusted_close']:.2f} V={row['volume']}")
 
 
 def _print_db_status() -> None:
@@ -113,17 +123,15 @@ def _print_db_status() -> None:
     print(f"Earliest stored date: {status['earliest_date']}")
     print(f"Latest stored date: {status['latest_date']}")
     print("Rows by ticker:")
-    if not status["rows_by_ticker"]:
-        print("  (none)")
-        return
     for ticker, row_count in status["rows_by_ticker"].items():
         print(f"  {ticker}: {row_count}")
+    if not status["rows_by_ticker"]:
+        print("  (none)")
 
 
 def _print_backtest_result(result) -> None:
     metrics = result.metrics
     benchmark = metrics.get("benchmark") or {}
-    benchmark_return = benchmark.get("return_pct")
     print(f"Strategy: {result.config.strategy_name}")
     print(f"Tickers: {', '.join(result.config.tickers)}")
     print(f"Date range: {result.config.start_date} to {result.config.end_date}")
@@ -135,29 +143,13 @@ def _print_backtest_result(result) -> None:
     print(f"Win rate: {metrics['win_rate']:.4%}")
     print(f"Profit factor: {metrics['profit_factor']}")
     print(f"Total commissions: {metrics['total_commissions']:.2f}")
-    print(f"Benchmark return: {benchmark_return if benchmark_return is not None else 'N/A'}")
+    print(f"Benchmark return: {benchmark.get('return_pct') if benchmark.get('return_pct') is not None else 'N/A'}")
     print(f"Backtest ID: {result.backtest_id if result.backtest_id is not None else 'not persisted'}")
 
 
 def _run_backtest_command(args: argparse.Namespace) -> None:
-    config = BacktestConfig(
-        strategy_name="moving_average_reversion",
-        tickers=args.tickers,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        starting_capital=args.starting_capital,
-        maximum_positions=args.maximum_positions,
-        position_size_pct=args.position_size_pct,
-        slippage_pct=args.slippage_pct,
-        commission_per_trade=args.commission,
-        maximum_holding_days=args.maximum_holding_days,
-    )
-    strategy = MovingAverageReversionStrategy(
-        moving_average_window=args.ma_window,
-        entry_discount_pct=args.entry_distance_pct,
-        stop_loss_pct=args.stop_loss_pct,
-        maximum_holding_days=args.maximum_holding_days,
-    )
+    config = BacktestConfig("moving_average_reversion", args.tickers, args.start_date, args.end_date, args.starting_capital, args.maximum_positions, args.position_size_pct, args.slippage_pct, args.commission, args.maximum_holding_days)
+    strategy = MovingAverageReversionStrategy(args.ma_window, args.entry_distance_pct, args.stop_loss_pct, args.maximum_holding_days)
     try:
         result = run_backtest(config, strategy, benchmark_ticker=args.benchmark, persist=not args.no_persist)
     except ValueError as exc:
@@ -184,36 +176,89 @@ def _show_backtest(backtest_id: int) -> None:
     print(f"Parameters: {json.dumps(parameters.get('config', parameters), sort_keys=True)}")
     print(f"Completed trades: {len(trades)}")
     for trade in trades[:10]:
-        print(
-            f"  {trade['ticker']} {trade['entry_date']}->{trade['exit_date']} "
-            f"qty={trade['quantity']} pnl={trade['pnl']:.2f} return={trade['return_pct']:.4%}"
-        )
+        print(f"  {trade['ticker']} {trade['entry_date']}->{trade['exit_date']} qty={trade['quantity']} pnl={trade['pnl']:.2f} return={trade['return_pct']:.4%}")
     print(f"Snapshots: {len(snapshots)}")
     if snapshots:
-        first = snapshots[0]
-        last = snapshots[-1]
-        print(f"Snapshot range: {first['snapshot_date']} to {last['snapshot_date']}")
-        print(f"Ending snapshot value: {last['total_value']:.2f}")
+        print(f"Snapshot range: {snapshots[0]['snapshot_date']} to {snapshots[-1]['snapshot_date']}")
+        print(f"Ending snapshot value: {snapshots[-1]['total_value']:.2f}")
+
+
+def _report_backtest(args: argparse.Namespace) -> None:
+    report = create_backtest_report(args.backtest_id)
+    print(f"Backtest ID: {report.backtest_id}")
+    print(f"Strategy: {report.run['strategy']}")
+    print(f"Date range: {report.run['start_date']} to {report.run['end_date']}")
+    print(f"Ending value: {report.run['ending_capital']:.2f}")
+    print(f"Total return: {report.performance['total_return']:.4%}")
+    print(f"Benchmark return: {report.performance['benchmark_return'] if report.performance['benchmark_return'] is not None else 'N/A'}")
+    print(f"Excess return: {report.performance['excess_return'] if report.performance['excess_return'] is not None else 'N/A'}")
+    print(f"Maximum drawdown: {report.performance['maximum_drawdown']:.4%}")
+    print(f"Completed trades: {report.performance['completed_trades']}")
+    print(f"Win rate: {report.performance['win_rate']:.4%}")
+    print(f"Profit factor: {report.performance['profit_factor']}")
+    if report.warnings:
+        print("Warnings:")
+        for warning in report.warnings:
+            print(f"  - {warning}")
+    if args.show_attribution:
+        print("Ticker attribution:")
+        for row in report.ticker_attribution["rows"]:
+            print(f"  {row['ticker']}: trades={row['completed_trade_count']} net_pnl={row['net_pnl']:.2f} win_rate={row['win_rate']:.2%}")
+    if args.show_exit_reasons:
+        print("Exit reasons:")
+        for row in report.exit_reasons:
+            print(f"  {row['exit_reason']}: trades={row['trade_count']} net_pnl={row['net_pnl']:.2f}")
+    if args.show_monthly:
+        print("Monthly returns:")
+        for row in report.monthly_returns[-12:]:
+            print(f"  {row['month']}: {row['monthly_return'] if row['monthly_return'] is not None else 'N/A'}")
+    if args.export_dir:
+        files = export_backtest_report(report, args.export_dir)
+        print("Exported files:")
+        for path in files:
+            print(f"  {path}")
+
+
+def _compare_backtests_command(args: argparse.Namespace) -> None:
+    comparison = compare_backtests(args.backtest_ids, sort_by=args.sort_by, descending=args.descending)
+    print("Backtest comparison:")
+    for row in comparison["rows"]:
+        print(f"  {row['backtest_id']}: return={row['total_return']:.4%} max_dd={row['maximum_drawdown']:.4%} trades={row['completed_trades']}")
+    if comparison["warnings"]:
+        print("Warnings:")
+        for warning in comparison["warnings"]:
+            print(f"  - {warning}")
+    if args.export_dir:
+        files = export_comparison(comparison, args.export_dir)
+        print("Exported files:")
+        for path in files:
+            print(f"  {path}")
+
+
+def _run_experiment_command(args: argparse.Namespace) -> None:
+    config = experiment_config_from_dict(json.loads(Path(args.experiment_file).read_text(encoding="utf-8")))
+    results = run_experiment(config)
+    summary = experiment_summary(config, results)
+    print(f"Experiment: {config.name}")
+    for row in summary["results"]:
+        print(f"  {row['parameter_set_name']}: dev_return={row['development_total_return']:.4%} val_return={row['validation_total_return']:.4%} dev_id={row['development_backtest_id']} val_id={row['validation_backtest_id']} warnings={row['warnings']}")
+    if args.export_dir:
+        files = export_experiment(summary, args.export_dir)
+        print("Exported files:")
+        for path in files:
+            print(f"  {path}")
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     """Run the command-line interface."""
     configure_logging()
     args = parse_args(argv)
-
     if args.command == "init-db":
         initialize_database()
         print("Database initialized.")
     elif args.command == "update-prices":
         initialize_database()
-        tickers = args.tickers or DEFAULT_TEST_TICKERS
-        summary = update_price_universe(
-            tickers,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            batch_size=args.batch_size,
-        )
-        _print_update_summary(summary)
+        _print_update_summary(update_price_universe(args.tickers or DEFAULT_TEST_TICKERS, args.start_date, args.end_date, args.batch_size))
     elif args.command == "show-prices":
         _show_prices(args.ticker, args.start_date, args.end_date, args.limit)
     elif args.command == "run-backtest":
@@ -221,9 +266,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         _run_backtest_command(args)
     elif args.command == "show-backtest":
         _show_backtest(args.backtest_id)
+    elif args.command == "report-backtest":
+        _report_backtest(args)
+    elif args.command == "compare-backtests":
+        _compare_backtests_command(args)
+    elif args.command == "run-experiment":
+        _run_experiment_command(args)
     elif args.command == "db-status":
         _print_db_status()
 
 
 if __name__ == "__main__":
     main()
+
