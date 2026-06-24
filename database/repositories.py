@@ -173,6 +173,20 @@ def security_exists(ticker: str, database_path: Optional[DatabasePath] = None) -
     return row is not None
 
 
+def get_security(ticker: str, database_path: Optional[DatabasePath] = None) -> Optional[Dict[str, Any]]:
+    """Return one security row."""
+    with get_connection(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT ticker, company_name, exchange, security_type, is_active, updated_at
+            FROM securities
+            WHERE ticker = ?
+            """,
+            (ticker.strip().upper(),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def get_database_status(database_path: Optional[DatabasePath] = None) -> Dict[str, Any]:
     """Return high-level database status metrics for CLI reporting."""
     with get_connection(database_path) as connection:

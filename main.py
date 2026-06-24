@@ -29,6 +29,8 @@ from fundamentals.service import (
 from reporting.backtest_report import create_backtest_report
 from reporting.comparison import compare_backtests
 from reporting.exports import export_backtest_report, export_comparison, export_experiment
+from reporting.graham_report import export_graham_evaluations, graham_evaluation_to_dict, graham_summary_row
+from strategies.graham_value import GrahamValueStrategy
 from strategies.moving_average_reversion import MovingAverageReversionStrategy
 
 
@@ -114,6 +116,40 @@ def build_parser() -> argparse.ArgumentParser:
     show_fundamentals_parser = subparsers.add_parser("show-fundamentals", help="Show point-in-time fundamentals")
     show_fundamentals_parser.add_argument("ticker")
     show_fundamentals_parser.add_argument("--as-of", required=True)
+
+    evaluate_graham = subparsers.add_parser("evaluate-graham", help="Evaluate one Graham candidate")
+    evaluate_graham.add_argument("ticker")
+    evaluate_graham.add_argument("--as-of", required=True)
+    evaluate_graham.add_argument("--minimum-margin-of-safety", type=float, default=0.30)
+    evaluate_graham.add_argument("--minimum-graham-score", type=float, default=70.0)
+    evaluate_graham.add_argument("--minimum-data-quality-score", type=float, default=60.0)
+    evaluate_graham.add_argument("--json", action="store_true")
+    evaluate_graham.add_argument("--export-dir", default=None)
+
+    screen_graham = subparsers.add_parser("screen-graham", help="Screen multiple Graham candidates")
+    screen_graham.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
+    screen_graham.add_argument("--as-of", required=True)
+    screen_graham.add_argument("--minimum-margin-of-safety", type=float, default=0.30)
+    screen_graham.add_argument("--minimum-graham-score", type=float, default=70.0)
+    screen_graham.add_argument("--minimum-data-quality-score", type=float, default=60.0)
+    screen_graham.add_argument("--json", action="store_true")
+    screen_graham.add_argument("--export-dir", default=None)
+
+    graham_backtest = subparsers.add_parser("run-graham-backtest", help="Run the standalone Graham backtest")
+    graham_backtest.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
+    graham_backtest.add_argument("--start-date", required=True)
+    graham_backtest.add_argument("--end-date", required=True)
+    graham_backtest.add_argument("--starting-capital", type=float, default=100000.0)
+    graham_backtest.add_argument("--maximum-positions", type=int, default=10)
+    graham_backtest.add_argument("--position-size-pct", type=float, default=0.10)
+    graham_backtest.add_argument("--minimum-margin-of-safety", type=float, default=0.30)
+    graham_backtest.add_argument("--minimum-graham-score", type=float, default=70.0)
+    graham_backtest.add_argument("--minimum-data-quality-score", type=float, default=60.0)
+    graham_backtest.add_argument("--maximum-holding-days", type=int, default=504)
+    graham_backtest.add_argument("--stop-loss-pct", type=float, default=None)
+    graham_backtest.add_argument("--reevaluation-frequency", default="weekly")
+    graham_backtest.add_argument("--benchmark", default=None)
+    graham_backtest.add_argument("--no-persist", action="store_true")
 
     subparsers.add_parser("db-status", help="Show SQLite database status")
     parser.set_defaults(command="init-db")
@@ -334,6 +370,89 @@ def _show_fundamentals_command(args: argparse.Namespace) -> None:
         )
 
 
+def _graham_strategy(args: argparse.Namespace) -> GrahamValueStrategy:
+    return GrahamValueStrategy(
+        minimum_margin_of_safety=args.minimum_margin_of_safety,
+        minimum_graham_score=args.minimum_graham_score,
+        minimum_data_quality_score=args.minimum_data_quality_score,
+        maximum_holding_days=getattr(args, "maximum_holding_days", 504),
+        stop_loss_pct=getattr(args, "stop_loss_pct", None),
+        reevaluation_frequency=getattr(args, "reevaluation_frequency", "weekly"),
+    )
+
+
+def _evaluate_graham_command(args: argparse.Namespace) -> None:
+    strategy = _graham_strategy(args)
+    try:
+        evaluation = strategy.evaluate(args.ticker, args.as_of)
+    except Exception as exc:
+        print(f"Graham evaluation failed: {exc}")
+        print("If data is missing, run update-prices and update-fundamentals first.")
+        return
+    if args.json:
+        print(json.dumps(graham_evaluation_to_dict(evaluation), indent=2, sort_keys=True, default=str))
+    else:
+        row = graham_summary_row(evaluation)
+        print(f"{row['ticker']} as of {row['evaluation_date']}")
+        print(f"Price: {row['price']}")
+        print(f"EPS: {row['eps']}")
+        print(f"Book value/share: {row['book_value_per_share']}")
+        print(f"Graham Number: {row['graham_number']}")
+        print(f"Margin of safety: {row['margin_of_safety']}")
+        print(f"Graham score: {row['graham_quality_score']}")
+        print(f"Data-quality score: {row['data_quality_score']}")
+        print(f"Classification: {row['classification']}")
+        print(f"Qualification: {row['qualification_status']}")
+        print(f"Signal: {row['signal_type']}")
+        print(f"Disqualifications: {row['disqualification_reasons'] or '(none)'}")
+        print(f"Warnings: {row['warnings'] or '(none)'}")
+    if args.export_dir:
+        for path in export_graham_evaluations([evaluation], args.export_dir, f"graham-{evaluation.ticker}-{evaluation.evaluation_date}.json"):
+            print(f"Exported {path}")
+
+
+def _screen_graham_command(args: argparse.Namespace) -> None:
+    strategy = _graham_strategy(args)
+    evaluations = [strategy.evaluate(ticker, args.as_of) for ticker in args.tickers]
+    rows = [graham_summary_row(evaluation) for evaluation in evaluations]
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+    else:
+        for row in rows:
+            print(
+                f"{row['ticker']} price={row['price']} eps={row['eps']} bvps={row['book_value_per_share']} "
+                f"graham={row['graham_number']} mos={row['margin_of_safety']} score={row['graham_quality_score']} "
+                f"dq={row['data_quality_score']} class={row['classification']} status={row['qualification_status']} "
+                f"reasons={row['disqualification_reasons'] or '(none)'}"
+            )
+    if args.export_dir:
+        for path in export_graham_evaluations(evaluations, args.export_dir):
+            print(f"Exported {path}")
+
+
+def _run_graham_backtest_command(args: argparse.Namespace) -> None:
+    config = BacktestConfig(
+        "graham_value_v1",
+        args.tickers,
+        args.start_date,
+        args.end_date,
+        args.starting_capital,
+        args.maximum_positions,
+        args.position_size_pct,
+        0.001,
+        0.0,
+        args.maximum_holding_days,
+    )
+    strategy = _graham_strategy(args)
+    try:
+        result = run_backtest(config, strategy, benchmark_ticker=args.benchmark, persist=not args.no_persist)
+    except ValueError as exc:
+        print(f"Graham backtest failed: {exc}")
+        print("Run update-prices and update-fundamentals before running Graham backtests.")
+        return
+    _print_backtest_result(result)
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     """Run the command-line interface."""
     configure_logging()
@@ -365,6 +484,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         _show_filings_command(args)
     elif args.command == "show-fundamentals":
         _show_fundamentals_command(args)
+    elif args.command == "evaluate-graham":
+        _evaluate_graham_command(args)
+    elif args.command == "screen-graham":
+        _screen_graham_command(args)
+    elif args.command == "run-graham-backtest":
+        _run_graham_backtest_command(args)
     elif args.command == "db-status":
         _print_db_status()
 
