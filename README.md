@@ -6,7 +6,7 @@ Live brokerage integration, live trading, options, machine learning, dashboards,
 
 ## Current phase
 
-Phase 3B: minimal deterministic historical backtesting and portfolio simulation engine.
+Phase 3C: saved-backtest review, comparison, attribution, exports, and development/validation experiment reporting.
 
 Included:
 
@@ -27,6 +27,10 @@ Included:
 - Deterministic next-day-open backtest execution engine
 - Whole-share long-only portfolio simulation
 - Slippage, commissions, maximum positions, daily snapshots, metrics, benchmark returns, and SQLite persistence
+- Saved-backtest review with ticker attribution, exit-reason analysis, time-period returns, and equity/drawdown series
+- Multi-run comparison with comparability warnings
+- Explicit development/validation experiment runner without automatic optimization
+- CSV and JSON report exports
 
 ## Project structure
 
@@ -245,6 +249,7 @@ Empty downloads can happen for invalid tickers, unsupported symbols, market holi
 If an invalid ticker fails, continue using `db-status` and `show-prices` to inspect any tickers that did update successfully.
 
 All future strategy and backtesting modules should read price history from SQLite through repository functions rather than making their own yfinance calls.
+
 
 
 

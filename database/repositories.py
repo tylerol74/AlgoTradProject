@@ -305,7 +305,8 @@ def create_backtest_run(
             """,
             (strategy, start_date, end_date, starting_capital, None, parameters_json, _utc_now_iso()),
         )
-        return int(cursor.lastrowid)
+        backtest_id = int(cursor.lastrowid)
+    return backtest_id
 
 
 def complete_backtest_run(
@@ -433,3 +434,57 @@ def get_portfolio_snapshots(backtest_id: int, database_path: Optional[DatabasePa
             (backtest_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+def list_backtest_runs(
+    strategy: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: Optional[int] = None,
+    database_path: Optional[DatabasePath] = None,
+) -> List[Dict[str, Any]]:
+    """List saved backtest runs with optional filters."""
+    query = [
+        """
+        SELECT backtest_id, strategy, start_date, end_date, starting_capital,
+               ending_capital, parameters_json, created_at
+        FROM backtest_runs
+        WHERE 1 = 1
+        """
+    ]
+    parameters: List[Any] = []
+    if strategy:
+        query.append("AND strategy = ?")
+        parameters.append(strategy)
+    if start_date:
+        query.append("AND start_date >= ?")
+        parameters.append(start_date)
+    if end_date:
+        query.append("AND end_date <= ?")
+        parameters.append(end_date)
+    query.append("ORDER BY backtest_id")
+    if limit is not None:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        query.append("LIMIT ?")
+        parameters.append(limit)
+    with get_connection(database_path) as connection:
+        rows = connection.execute("\n".join(query), parameters).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_backtest_bundle(backtest_id: int, database_path: Optional[DatabasePath] = None) -> Dict[str, Any]:
+    """Return a saved run, trades, snapshots, and parsed parameters_json."""
+    import json
+
+    run = get_backtest_run(backtest_id, database_path=database_path)
+    if run is None:
+        raise ValueError(f"Backtest {backtest_id} not found")
+    parameters = json.loads(run["parameters_json"]) if run.get("parameters_json") else {}
+    return {
+        "run": run,
+        "trades": get_backtest_trades(backtest_id, database_path=database_path),
+        "snapshots": get_portfolio_snapshots(backtest_id, database_path=database_path),
+        "parameters": parameters,
+    }
+
+
