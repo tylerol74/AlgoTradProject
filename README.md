@@ -602,6 +602,87 @@ SEC company facts vary by issuer. Some companies report unusual concepts, restat
 
 The future UI should use the backend configuration models rather than duplicating Graham thresholds.
 
+## Phase 5A Universe and Batch Ingestion
+
+Phase 5A adds a central `security_universe` table and ingestion run tracking tables. These migrations are additive and idempotent; existing price, filing, fact, backtest, and SEC ticker-map tables are not dropped or rebuilt.
+
+Universe rows preserve normalized ticker, company name, CIK, exchange, security type, active status, Graham eligibility status, exclusion reasons, source metadata, and flags for ADRs, ETFs, ETNs, REITs, financials, warrants, rights, units, preferred shares, and OTC securities. The initial source is the cached SEC ticker map already supported by the project. When only SEC ticker-map data is available, exchange/security-type metadata is necessarily conservative and should be improved later with official exchange security files.
+
+Default Graham-eligible securities are active U.S. listed common-stock candidates with a valid CIK, excluding ETFs, ETNs, warrants, rights, units, preferreds, OTC tickers, ADRs, REITs, banks, insurers, and other financial companies. Exclusion reasons are stored instead of silently discarding rows.
+
+Universe commands:
+
+```powershell
+python main.py update-universe
+python main.py universe-status
+python main.py list-universe --eligible-only --limit 25
+python main.py sample-universe --eligible-only --count 100 --seed 42 --export-dir outputs\universe_sample
+```
+
+Batch price ingestion uses the existing market-data module and yfinance abstraction. It does not change strategy thresholds:
+
+```powershell
+python main.py update-universe-prices `
+  --ticker-file outputs\universe_sample\eligible-universe-100.txt `
+  --years 6 `
+  --batch-size 25 `
+  --retry-failures `
+  --max-retries 2
+```
+
+Batch SEC fundamentals ingestion uses the existing SEC client, respects the configured request delay, and requires `SEC_USER_AGENT` when live SEC access is needed:
+
+```powershell
+python main.py update-universe-fundamentals `
+  --ticker-file outputs\universe_sample\eligible-universe-100.txt `
+  --years 6 `
+  --batch-size 10 `
+  --refresh-normalization
+```
+
+Controlled normalization refresh:
+
+```powershell
+python main.py refresh-fundamentals-normalization `
+  --tickers XOM VZ GM `
+  --years 6 `
+  --run-audit `
+  --as-of 2025-06-01
+```
+
+If `--skip-download` is used, the command explains that existing local normalized facts are left unchanged. If live SEC access is needed and `SEC_USER_AGENT` is unset, the command reports a blocked status rather than making partial requests.
+
+Batch commands create `ingestion_runs` and `ingestion_run_items` records with concise per-ticker statuses, inserted/updated/unchanged/skipped counts, retry counts, and sanitized error messages. Failed or partial items can be resumed where practical:
+
+```powershell
+python main.py update-universe-prices --resume-run 12 --universe all-eligible
+```
+
+Coverage and freshness reporting:
+
+```powershell
+python main.py universe-coverage-report `
+  --ticker-file outputs\universe_sample\eligible-universe-100.txt `
+  --as-of 2025-06-01 `
+  --export-dir outputs\universe_coverage_100
+```
+
+The coverage report includes requested/resolved/valid ticker counts, price and fundamentals coverage, filing/EPS/shares/equity/debt/five-year-history coverage, data-ready coverage, strategy-qualified count, missing fields, exclusion/disqualification reasons, and conservative price/fundamental freshness flags.
+
+True 100-ticker workflow:
+
+```powershell
+python main.py update-universe
+python main.py sample-universe --eligible-only --count 100 --seed 42 --export-dir outputs\universe_sample
+python main.py update-universe-prices --ticker-file outputs\universe_sample\eligible-universe-100.txt --years 6 --batch-size 25
+python main.py update-universe-fundamentals --ticker-file outputs\universe_sample\eligible-universe-100.txt --years 6 --batch-size 10 --refresh-normalization
+python main.py audit-graham-data --ticker-file outputs\universe_sample\eligible-universe-100.txt --as-of 2025-06-01 --export-missing-data-plan --export-dir outputs\graham_audit_100
+```
+
+A true 100-ticker audit must produce at least 100 ticker rows. If live price or SEC access is unavailable, the workflow should be reported as blocked rather than described as completed. Audits remain read-only and never auto-download missing prices or fundamentals.
+
+Known limitations: Phase 5A does not add an official exchange master, delisting history, sector master, Streamlit UI, broker integration, live trading, machine learning, or financial-sector/REIT-specific Graham valuation.
+
 
 
 

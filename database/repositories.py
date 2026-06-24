@@ -5,6 +5,7 @@ and write through a consistent database boundary.
 """
 
 import logging
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -232,12 +233,36 @@ def get_available_tickers(database_path: Optional[DatabasePath] = None) -> List[
     return [row["ticker"] for row in rows]
 
 
+def get_sec_ticker_map_rows(database_path: Optional[DatabasePath] = None) -> List[Dict[str, Any]]:
+    """Return cached SEC ticker map rows."""
+    with get_connection(database_path) as connection:
+        rows = connection.execute("SELECT ticker, cik, title, source, updated_at FROM sec_ticker_map ORDER BY ticker").fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_active_common_stock_tickers(
     limit: Optional[int] = None,
     offset: int = 0,
     database_path: Optional[DatabasePath] = None,
 ) -> List[str]:
     """Return stored active common-stock tickers eligible for Graham auditing."""
+    with get_connection(database_path) as connection:
+        has_universe = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='security_universe'"
+        ).fetchone()
+        if has_universe:
+            rows = connection.execute(
+                """
+                SELECT normalized_ticker AS ticker
+                FROM security_universe
+                WHERE eligibility_status = 'eligible'
+                ORDER BY normalized_ticker
+                LIMIT COALESCE(?, -1) OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+            if rows:
+                return [row["ticker"] for row in rows]
     excluded_terms = ("etf", "fund", "etn", "warrant", "right", "unit", "preferred", "reit")
     query = [
         """
@@ -263,6 +288,271 @@ def get_active_common_stock_tickers(
     with get_connection(database_path) as connection:
         rows = connection.execute("\n".join(query), parameters).fetchall()
     return [row["ticker"] for row in rows]
+
+
+def upsert_security_universe(rows: Sequence[Dict[str, Any]], database_path: Optional[DatabasePath] = None) -> int:
+    """Insert or update central security universe rows."""
+    if not rows:
+        return 0
+    now = _utc_now_iso()
+    params = []
+    for row in rows:
+        params.append(
+            (
+                row["ticker"],
+                row["normalized_ticker"],
+                row.get("company_name"),
+                row.get("cik"),
+                row.get("exchange"),
+                row.get("security_type"),
+                row.get("sector"),
+                row.get("industry"),
+                1 if row.get("is_active") else 0,
+                1 if row.get("is_common_stock") else 0,
+                1 if row.get("is_adr") else 0,
+                1 if row.get("is_etf") else 0,
+                1 if row.get("is_etn") else 0,
+                1 if row.get("is_reit") else 0,
+                1 if row.get("is_financial") else 0,
+                1 if row.get("is_warrant") else 0,
+                1 if row.get("is_right") else 0,
+                1 if row.get("is_unit") else 0,
+                1 if row.get("is_preferred") else 0,
+                1 if row.get("is_otc") else 0,
+                row.get("source") or "unknown",
+                row.get("source_updated_at"),
+                row.get("first_seen_at") or now,
+                now,
+                row.get("delisted_at"),
+                row.get("eligibility_status") or "excluded",
+                json.dumps(row.get("eligibility_reasons") or [], sort_keys=True),
+                json.dumps(row.get("metadata") or {}, sort_keys=True),
+            )
+        )
+    with get_connection(database_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO security_universe (
+                ticker, normalized_ticker, company_name, cik, exchange, security_type, sector, industry,
+                is_active, is_common_stock, is_adr, is_etf, is_etn, is_reit, is_financial,
+                is_warrant, is_right, is_unit, is_preferred, is_otc, source, source_updated_at,
+                first_seen_at, last_seen_at, delisted_at, eligibility_status, eligibility_reasons,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(normalized_ticker) DO UPDATE SET
+                ticker = excluded.ticker,
+                company_name = COALESCE(excluded.company_name, security_universe.company_name),
+                cik = COALESCE(excluded.cik, security_universe.cik),
+                exchange = excluded.exchange,
+                security_type = excluded.security_type,
+                sector = excluded.sector,
+                industry = excluded.industry,
+                is_active = excluded.is_active,
+                is_common_stock = excluded.is_common_stock,
+                is_adr = excluded.is_adr,
+                is_etf = excluded.is_etf,
+                is_etn = excluded.is_etn,
+                is_reit = excluded.is_reit,
+                is_financial = excluded.is_financial,
+                is_warrant = excluded.is_warrant,
+                is_right = excluded.is_right,
+                is_unit = excluded.is_unit,
+                is_preferred = excluded.is_preferred,
+                is_otc = excluded.is_otc,
+                source = excluded.source,
+                source_updated_at = excluded.source_updated_at,
+                last_seen_at = excluded.last_seen_at,
+                delisted_at = excluded.delisted_at,
+                eligibility_status = excluded.eligibility_status,
+                eligibility_reasons = excluded.eligibility_reasons,
+                metadata_json = excluded.metadata_json
+            """,
+            params,
+        )
+    return len(params)
+
+
+def list_security_universe(
+    eligible_only: bool = False,
+    exchange: Optional[str] = None,
+    security_type: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    sort_by: str = "ticker",
+    descending: bool = False,
+    database_path: Optional[DatabasePath] = None,
+) -> List[Dict[str, Any]]:
+    """List central security universe rows."""
+    allowed_sort = {
+        "ticker": "normalized_ticker",
+        "company_name": "company_name",
+        "exchange": "exchange",
+        "security_type": "security_type",
+        "eligibility_status": "eligibility_status",
+        "last_seen_at": "last_seen_at",
+    }
+    column = allowed_sort.get(sort_by, "normalized_ticker")
+    query = ["SELECT * FROM security_universe WHERE 1 = 1"]
+    params: List[Any] = []
+    if eligible_only:
+        query.append("AND eligibility_status = 'eligible'")
+    if exchange:
+        query.append("AND exchange = ?")
+        params.append(exchange)
+    if security_type:
+        query.append("AND security_type = ?")
+        params.append(security_type)
+    direction = "DESC" if descending else "ASC"
+    query.append(f"ORDER BY {column} {direction}, normalized_ticker ASC")
+    if limit is not None:
+        query.append("LIMIT ? OFFSET ?")
+        params.extend([limit, offset])
+    elif offset:
+        query.append("LIMIT -1 OFFSET ?")
+        params.append(offset)
+    with get_connection(database_path) as connection:
+        rows = connection.execute("\n".join(query), params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def security_universe_status(database_path: Optional[DatabasePath] = None) -> Dict[str, Any]:
+    """Return central universe status counts."""
+    with get_connection(database_path) as connection:
+        total = connection.execute("SELECT COUNT(*) AS c FROM security_universe").fetchone()["c"]
+        active = connection.execute("SELECT COUNT(*) AS c FROM security_universe WHERE is_active = 1").fetchone()["c"]
+        common = connection.execute("SELECT COUNT(*) AS c FROM security_universe WHERE is_common_stock = 1").fetchone()["c"]
+        eligible = connection.execute("SELECT COUNT(*) AS c FROM security_universe WHERE eligibility_status = 'eligible'").fetchone()["c"]
+        last_update = connection.execute("SELECT MAX(last_seen_at) AS v FROM security_universe").fetchone()["v"]
+        rows = connection.execute("SELECT eligibility_reasons FROM security_universe").fetchall()
+    reason_counts: Dict[str, int] = {}
+    for row in rows:
+        for reason in json.loads(row["eligibility_reasons"] or "[]"):
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return {
+        "total_securities": int(total),
+        "active_securities": int(active),
+        "common_stocks": int(common),
+        "eligible_graham_securities": int(eligible),
+        "excluded_by_security_type": sum(reason_counts.get(reason, 0) for reason in ("etf", "etn", "warrant", "right", "unit", "preferred", "adr", "not_common_stock")),
+        "excluded_by_exchange": reason_counts.get("unsupported_exchange", 0),
+        "excluded_financials": reason_counts.get("financial", 0),
+        "excluded_reits": reason_counts.get("reit", 0),
+        "missing_cik": reason_counts.get("missing_cik", 0),
+        "missing_exchange": reason_counts.get("missing_exchange", 0),
+        "invalid_tickers": reason_counts.get("invalid_ticker", 0),
+        "last_update_timestamp": last_update,
+        "exclusion_reasons": reason_counts,
+    }
+
+
+def create_ingestion_run(run_type: str, requested_count: int, configuration: Dict[str, Any], database_path: Optional[DatabasePath] = None) -> int:
+    """Create an ingestion run tracking row."""
+    with get_connection(database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO ingestion_runs (run_type, started_at, requested_count, configuration_json, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_type, _utc_now_iso(), requested_count, json.dumps(configuration, sort_keys=True), "running"),
+        )
+        return int(cursor.lastrowid)
+
+
+def add_ingestion_run_item(run_id: int, item: Dict[str, Any], database_path: Optional[DatabasePath] = None) -> None:
+    """Add one ingestion run item."""
+    with get_connection(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO ingestion_run_items (
+                run_id, ticker, status, inserted_count, updated_count, unchanged_count, skipped_count,
+                retry_count, error_type, error_message, started_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                item["ticker"],
+                item["status"],
+                int(item.get("inserted_count", 0)),
+                int(item.get("updated_count", 0)),
+                int(item.get("unchanged_count", 0)),
+                int(item.get("skipped_count", 0)),
+                int(item.get("retry_count", 0)),
+                item.get("error_type"),
+                item.get("error_message"),
+                item.get("started_at") or _utc_now_iso(),
+                item.get("completed_at") or _utc_now_iso(),
+            ),
+        )
+
+
+def complete_ingestion_run(run_id: int, status: str, database_path: Optional[DatabasePath] = None) -> None:
+    """Complete an ingestion run from its item statuses."""
+    with get_connection(database_path) as connection:
+        counts = connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded,
+                SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) AS partial,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+            FROM ingestion_run_items
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE ingestion_runs
+            SET completed_at = ?, succeeded_count = ?, partial_count = ?, failed_count = ?, status = ?
+            WHERE run_id = ?
+            """,
+            (
+                _utc_now_iso(),
+                int(counts["succeeded"] or 0),
+                int(counts["partial"] or 0),
+                int(counts["failed"] or 0),
+                status,
+                run_id,
+            ),
+        )
+
+
+def get_ingestion_run_items(run_id: int, statuses: Optional[Sequence[str]] = None, database_path: Optional[DatabasePath] = None) -> List[Dict[str, Any]]:
+    """Return ingestion run items, optionally filtered by status."""
+    query = ["SELECT * FROM ingestion_run_items WHERE run_id = ?"]
+    params: List[Any] = [run_id]
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
+        query.append(f"AND status IN ({placeholders})")
+        params.extend(statuses)
+    query.append("ORDER BY item_id")
+    with get_connection(database_path) as connection:
+        rows = connection.execute("\n".join(query), params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def price_freshness(tickers: Sequence[str], database_path: Optional[DatabasePath] = None) -> Dict[str, Optional[str]]:
+    """Return latest stored price date for each ticker."""
+    return {ticker: get_latest_price_date(ticker, database_path=database_path) for ticker in tickers}
+
+
+def fundamentals_freshness(tickers: Sequence[str], database_path: Optional[DatabasePath] = None) -> Dict[str, Dict[str, Optional[str]]]:
+    """Return latest accepted filing and report period for each ticker."""
+    result: Dict[str, Dict[str, Optional[str]]] = {}
+    with get_connection(database_path) as connection:
+        for ticker in tickers:
+            row = connection.execute(
+                """
+                SELECT MAX(accepted_at) AS latest_accepted_at, MAX(report_period) AS latest_report_period
+                FROM fundamental_filings
+                WHERE ticker = ?
+                """,
+                (ticker.strip().upper(),),
+            ).fetchone()
+            result[ticker] = {
+                "latest_accepted_at": row["latest_accepted_at"],
+                "latest_report_period": row["latest_report_period"],
+            }
+    return result
 
 
 def get_trading_dates(

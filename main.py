@@ -9,12 +9,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from backtesting.engine import run_backtest
 from backtesting.models import BacktestConfig
-from config.settings import DEFAULT_TEST_TICKERS, LOG_LEVEL
+from config.settings import DEFAULT_TEST_TICKERS, LOG_LEVEL, SEC_USER_AGENT
 from configurations.models import GrahamStrategyConfig, UniverseConfig
 from configurations.presets import get_preset, list_presets
 from configurations.serialization import config_from_json, config_to_json
 from configurations.validation import ConfigurationValidationError
 from data.market_data import update_price_universe
+from data.universe import (
+    build_universe_from_sec_map,
+    coverage_freshness,
+    deterministic_sample,
+    read_ticker_file,
+    run_tracked_batch,
+    universe_status as get_universe_status,
+    universe_tickers,
+)
 from data import strategy_data as repository_strategy_data
 from database.repositories import (
     get_active_common_stock_tickers,
@@ -23,6 +32,7 @@ from database.repositories import (
     get_database_status,
     get_portfolio_snapshots,
     get_price_history,
+    list_security_universe,
 )
 from database.schema import initialize_database
 from experiments.models import experiment_config_from_dict
@@ -31,6 +41,7 @@ from fundamentals.repository import fundamentals_status
 from fundamentals.service import (
     get_filing_history,
     get_fundamentals_as_of,
+    update_fundamentals_for_ticker,
     update_fundamentals_universe,
 )
 from reporting.backtest_report import create_backtest_report
@@ -177,6 +188,97 @@ def build_parser() -> argparse.ArgumentParser:
     audit_graham.add_argument("--offset", type=int, default=0)
     audit_graham.add_argument("--include-missing-data", action="store_true", default=True)
     audit_graham.add_argument("--export-missing-data-plan", action="store_true")
+
+    update_universe = subparsers.add_parser("update-universe", help="Build or refresh the central security universe")
+    update_universe.add_argument("--source", choices=["all", "sec"], default="all")
+    update_universe.add_argument("--dry-run", action="store_true")
+    update_universe.add_argument("--json", action="store_true")
+    update_universe.add_argument("--export-dir", default=None)
+
+    subparsers.add_parser("universe-status", help="Show central security universe status")
+
+    list_universe = subparsers.add_parser("list-universe", help="List central security universe rows")
+    list_universe.add_argument("--eligible-only", action="store_true")
+    list_universe.add_argument("--exchange", default=None)
+    list_universe.add_argument("--security-type", default=None)
+    list_universe.add_argument("--limit", type=int, default=50)
+    list_universe.add_argument("--offset", type=int, default=0)
+    list_universe.add_argument("--sort-by", default="ticker")
+    list_universe.add_argument("--descending", action="store_true")
+    list_universe.add_argument("--json", action="store_true")
+    list_universe.add_argument("--export-dir", default=None)
+
+    sample_universe = subparsers.add_parser("sample-universe", help="Create a deterministic universe sample")
+    sample_universe.add_argument("--eligible-only", action="store_true")
+    sample_universe.add_argument("--count", type=int, default=100)
+    sample_universe.add_argument("--seed", type=int, default=None)
+    sample_universe.add_argument("--method", choices=["deterministic"], default="deterministic")
+    sample_universe.add_argument("--json", action="store_true")
+    sample_universe.add_argument("--export-dir", default=None)
+
+    universe_prices = subparsers.add_parser("update-universe-prices", help="Batch update prices for a universe")
+    price_source = universe_prices.add_mutually_exclusive_group(required=True)
+    price_source.add_argument("--universe", choices=["all-eligible"])
+    price_source.add_argument("--ticker-file")
+    universe_prices.add_argument("--limit", type=int, default=None)
+    universe_prices.add_argument("--offset", type=int, default=0)
+    universe_prices.add_argument("--start-date", default=None)
+    universe_prices.add_argument("--end-date", default=None)
+    universe_prices.add_argument("--years", type=int, default=None)
+    universe_prices.add_argument("--batch-size", type=int, default=None)
+    universe_prices.add_argument("--retry-failures", action="store_true")
+    universe_prices.add_argument("--max-retries", type=int, default=0)
+    universe_prices.add_argument("--resume-run", type=int, default=None)
+    universe_prices.add_argument("--dry-run", action="store_true")
+    universe_prices.add_argument("--json", action="store_true")
+    universe_prices.add_argument("--export-dir", default=None)
+
+    universe_fundamentals = subparsers.add_parser("update-universe-fundamentals", help="Batch update SEC fundamentals for a universe")
+    fundamentals_source = universe_fundamentals.add_mutually_exclusive_group(required=True)
+    fundamentals_source.add_argument("--universe", choices=["all-eligible"])
+    fundamentals_source.add_argument("--ticker-file")
+    universe_fundamentals.add_argument("--limit", type=int, default=None)
+    universe_fundamentals.add_argument("--offset", type=int, default=0)
+    universe_fundamentals.add_argument("--years", type=int, default=None)
+    universe_fundamentals.add_argument("--as-of", default=None)
+    universe_fundamentals.add_argument("--batch-size", type=int, default=None)
+    universe_fundamentals.add_argument("--retry-failures", action="store_true")
+    universe_fundamentals.add_argument("--max-retries", type=int, default=0)
+    universe_fundamentals.add_argument("--resume-run", type=int, default=None)
+    universe_fundamentals.add_argument("--refresh-normalization", action="store_true")
+    universe_fundamentals.add_argument("--force", action="store_true")
+    universe_fundamentals.add_argument("--skip-existing", action="store_true")
+    universe_fundamentals.add_argument("--dry-run", action="store_true")
+    universe_fundamentals.add_argument("--json", action="store_true")
+    universe_fundamentals.add_argument("--export-dir", default=None)
+
+    refresh_norm = subparsers.add_parser("refresh-fundamentals-normalization", help="Refresh normalized fundamentals under current mappings")
+    refresh_source = refresh_norm.add_mutually_exclusive_group(required=True)
+    refresh_source.add_argument("--tickers", nargs="+")
+    refresh_source.add_argument("--ticker-file")
+    refresh_source.add_argument("--universe", choices=["all-eligible"])
+    refresh_norm.add_argument("--limit", type=int, default=None)
+    refresh_norm.add_argument("--offset", type=int, default=0)
+    refresh_norm.add_argument("--years", type=int, default=None)
+    refresh_norm.add_argument("--as-of", default=None)
+    refresh_norm.add_argument("--dry-run", action="store_true")
+    refresh_norm.add_argument("--force", action="store_true")
+    refresh_norm.add_argument("--skip-download", action="store_true")
+    refresh_norm.add_argument("--run-audit", action="store_true")
+    refresh_norm.add_argument("--json", action="store_true")
+    refresh_norm.add_argument("--export-dir", default=None)
+    _add_graham_threshold_flags(refresh_norm)
+
+    coverage = subparsers.add_parser("universe-coverage-report", help="Report universe data coverage")
+    coverage_source = coverage.add_mutually_exclusive_group(required=True)
+    coverage_source.add_argument("--ticker-file")
+    coverage_source.add_argument("--universe", choices=["all-eligible"])
+    coverage.add_argument("--limit", type=int, default=None)
+    coverage.add_argument("--offset", type=int, default=0)
+    coverage.add_argument("--as-of", required=True)
+    coverage.add_argument("--json", action="store_true")
+    coverage.add_argument("--export-dir", default=None)
+    _add_graham_threshold_flags(coverage)
 
     graham_backtest = subparsers.add_parser("run-graham-backtest", help="Run the standalone Graham backtest")
     graham_backtest.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
@@ -706,6 +808,225 @@ def _audit_graham_data_command(args: argparse.Namespace) -> None:
         print(json.dumps(missing_plan, indent=2, sort_keys=True, default=str))
 
 
+def _write_json_export(payload: Any, export_dir: Optional[str], filename: str) -> Optional[Path]:
+    if not export_dir:
+        return None
+    directory = Path(export_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / filename
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    return path
+
+
+def _source_tickers(args: argparse.Namespace) -> Tuple[List[str], List[str]]:
+    if getattr(args, "ticker_file", None):
+        tickers, invalid = read_ticker_file(args.ticker_file)
+    elif getattr(args, "tickers", None):
+        tickers, invalid = _dedupe_tickers(args.tickers)
+    else:
+        tickers = universe_tickers(eligible_only=True, limit=args.limit, offset=args.offset)
+        invalid = []
+    if getattr(args, "ticker_file", None):
+        tickers = tickers[args.offset :]
+        if args.limit is not None:
+            tickers = tickers[: args.limit]
+    return tickers, invalid
+
+
+def _print_key_values(payload: Dict[str, Any]) -> None:
+    for key, value in payload.items():
+        print(f"{key}: {_format_cell(value)}")
+
+
+def _update_universe_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    result = build_universe_from_sec_map(refresh=False, dry_run=args.dry_run)
+    payload = {
+        "source": result.source,
+        "rows_seen": result.rows_seen,
+        "rows_upserted": result.rows_upserted,
+        "eligible_count": result.eligible_count,
+        "dry_run": result.dry_run,
+    }
+    path = _write_json_export(payload, args.export_dir, "universe-update.json")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    else:
+        _print_key_values(payload)
+        if path:
+            print(f"Exported {path}")
+
+
+def _universe_status_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    payload = get_universe_status()
+    _print_key_values(payload)
+
+
+def _list_universe_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    rows = list_security_universe(
+        eligible_only=args.eligible_only,
+        exchange=args.exchange,
+        security_type=args.security_type,
+        limit=args.limit,
+        offset=args.offset,
+        sort_by=args.sort_by,
+        descending=args.descending,
+    )
+    path = _write_json_export(rows, args.export_dir, "universe-list.json")
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+    else:
+        _print_aligned_table(rows, ["normalized_ticker", "company_name", "exchange", "security_type", "eligibility_status", "eligibility_reasons"])
+        if path:
+            print(f"Exported {path}")
+
+
+def _sample_universe_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    tickers = universe_tickers(eligible_only=args.eligible_only)
+    sample = deterministic_sample(tickers, args.count, args.seed)
+    payload = {"count": len(sample), "tickers": sample, "eligible_only": args.eligible_only, "seed": args.seed}
+    if args.export_dir:
+        directory = Path(args.export_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        text_path = directory / f"eligible-universe-{args.count}.txt"
+        text_path.write_text("\n".join(sample) + "\n", encoding="utf-8")
+        _write_json_export(payload, args.export_dir, f"eligible-universe-{args.count}.json")
+        print(f"Exported {text_path}")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    elif not args.export_dir:
+        for ticker in sample:
+            print(ticker)
+
+
+def _years_start_date(years: Optional[int]) -> Optional[str]:
+    if years is None:
+        return None
+    from datetime import date
+
+    today = date.today()
+    return date(today.year - years, today.month, today.day).isoformat()
+
+
+def _update_universe_prices_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    tickers, invalid = _source_tickers(args)
+    start_date = args.start_date or _years_start_date(args.years)
+    config = {"start_date": start_date, "end_date": args.end_date, "batch_size": args.batch_size, "invalid_tickers": invalid}
+
+    def worker(ticker: str) -> Dict[str, Any]:
+        return update_price_universe([ticker], start_date=start_date, end_date=args.end_date, batch_size=args.batch_size)["results"][0]
+
+    payload = run_tracked_batch(
+        "prices",
+        tickers,
+        worker,
+        config,
+        dry_run=args.dry_run,
+        max_retries=args.max_retries if args.retry_failures else 0,
+        resume_run=args.resume_run,
+    )
+    payload["invalid_tickers"] = invalid
+    path = _write_json_export(payload, args.export_dir, "universe-price-update.json")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    else:
+        _print_key_values({k: v for k, v in payload.items() if k != "results"})
+        if path:
+            print(f"Exported {path}")
+
+
+def _update_universe_fundamentals_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    tickers, invalid = _source_tickers(args)
+    config = {"years": args.years, "as_of": args.as_of, "invalid_tickers": invalid, "refresh_normalization": args.refresh_normalization}
+    if not args.dry_run and not SEC_USER_AGENT:
+        payload = {"status": "blocked", "error": "SEC_USER_AGENT is required for SEC fundamentals ingestion", "requested_count": len(tickers)}
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            _print_key_values(payload)
+        return
+
+    def worker(ticker: str) -> Dict[str, Any]:
+        return update_fundamentals_for_ticker(ticker, years=args.years)
+
+    payload = run_tracked_batch(
+        "fundamentals",
+        tickers,
+        worker,
+        config,
+        dry_run=args.dry_run,
+        max_retries=args.max_retries if args.retry_failures else 0,
+        resume_run=args.resume_run,
+    )
+    payload["invalid_tickers"] = invalid
+    path = _write_json_export(payload, args.export_dir, "universe-fundamentals-update.json")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    else:
+        _print_key_values({k: v for k, v in payload.items() if k != "results"})
+        if path:
+            print(f"Exported {path}")
+
+
+def _refresh_fundamentals_normalization_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    tickers, invalid = _source_tickers(args)
+    rows = []
+    if not args.skip_download and not args.dry_run and not SEC_USER_AGENT:
+        payload = {"status": "blocked", "error": "SEC_USER_AGENT is required when refresh requires SEC re-ingestion", "tickers": tickers}
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            _print_key_values({"status": payload["status"], "error": payload["error"], "tickers": len(tickers)})
+        return
+    if not args.skip_download and not args.dry_run:
+        for ticker in tickers:
+            rows.append(update_fundamentals_for_ticker(ticker, years=args.years))
+    else:
+        rows = [{"ticker": ticker, "status": "skipped", "warnings": ["download skipped; existing normalized facts left unchanged"]} for ticker in tickers]
+    audit_rows = []
+    if args.run_audit and args.as_of:
+        strategy = _graham_strategy(args)
+        audit_rows = [graham_audit_row(strategy.evaluate(ticker, args.as_of)) for ticker in tickers]
+    payload = {
+        "tickers": tickers,
+        "invalid_tickers": invalid,
+        "dry_run": args.dry_run,
+        "skip_download": args.skip_download,
+        "results": rows,
+        "audit_rows": audit_rows,
+    }
+    path = _write_json_export(payload, args.export_dir, "fundamentals-normalization-refresh.json")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    else:
+        _print_key_values({"tickers": len(tickers), "invalid_tickers": len(invalid), "audit_rows": len(audit_rows)})
+        if path:
+            print(f"Exported {path}")
+
+
+def _universe_coverage_report_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    tickers, invalid = _source_tickers(args)
+    strategy = _graham_strategy(args)
+    rows = [graham_audit_row(strategy.evaluate(ticker, args.as_of)) for ticker in tickers]
+    summary = graham_audit_summary(rows, invalid, len(tickers) + len(invalid))
+    freshness = coverage_freshness(tickers, args.as_of)
+    payload = {"rows": rows, "summary": summary, "freshness": freshness, "invalid_tickers": invalid}
+    path = _write_json_export(payload, args.export_dir, "universe-coverage-report.json")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    else:
+        _print_audit_summary(summary)
+        if path:
+            print(f"Exported {path}")
+
+
 def _run_graham_backtest_command(args: argparse.Namespace) -> None:
     config = BacktestConfig(
         "graham_value_v1",
@@ -799,6 +1120,22 @@ def main(argv: Optional[List[str]] = None) -> None:
         _screen_graham_command(args)
     elif args.command == "audit-graham-data":
         _audit_graham_data_command(args)
+    elif args.command == "update-universe":
+        _update_universe_command(args)
+    elif args.command == "universe-status":
+        _universe_status_command(args)
+    elif args.command == "list-universe":
+        _list_universe_command(args)
+    elif args.command == "sample-universe":
+        _sample_universe_command(args)
+    elif args.command == "update-universe-prices":
+        _update_universe_prices_command(args)
+    elif args.command == "update-universe-fundamentals":
+        _update_universe_fundamentals_command(args)
+    elif args.command == "refresh-fundamentals-normalization":
+        _refresh_fundamentals_normalization_command(args)
+    elif args.command == "universe-coverage-report":
+        _universe_coverage_report_command(args)
     elif args.command == "run-graham-backtest":
         _run_graham_backtest_command(args)
     elif args.command == "list-strategy-presets":
