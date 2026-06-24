@@ -286,3 +286,150 @@ def get_next_trading_day(
             (ticker.strip().upper(), trade_date),
         ).fetchone()
     return row["next_date"] if row and row["next_date"] else None
+
+def create_backtest_run(
+    strategy: str,
+    start_date: str,
+    end_date: str,
+    starting_capital: float,
+    parameters_json: str,
+    database_path: Optional[DatabasePath] = None,
+) -> int:
+    """Create a persisted backtest run and return its ID."""
+    with get_connection(database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO backtest_runs (
+                strategy, start_date, end_date, starting_capital, ending_capital, parameters_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (strategy, start_date, end_date, starting_capital, None, parameters_json, _utc_now_iso()),
+        )
+        return int(cursor.lastrowid)
+
+
+def complete_backtest_run(
+    backtest_id: int,
+    ending_capital: float,
+    database_path: Optional[DatabasePath] = None,
+) -> None:
+    """Set ending capital for a persisted backtest run."""
+    with get_connection(database_path) as connection:
+        connection.execute(
+            "UPDATE backtest_runs SET ending_capital = ? WHERE backtest_id = ?",
+            (ending_capital, backtest_id),
+        )
+
+
+def insert_backtest_trades(
+    backtest_id: int,
+    trades: Sequence[Any],
+    database_path: Optional[DatabasePath] = None,
+) -> int:
+    """Persist completed backtest trades."""
+    parameters = [
+        (
+            backtest_id,
+            trade.ticker,
+            trade.signal_date,
+            trade.entry_date,
+            trade.entry_price,
+            trade.exit_date,
+            trade.exit_price,
+            trade.quantity,
+            trade.net_pnl,
+            trade.return_pct,
+            trade.exit_reason,
+        )
+        for trade in trades
+    ]
+    if not parameters:
+        return 0
+    with get_connection(database_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO backtest_trades (
+                backtest_id, ticker, signal_date, entry_date, entry_price, exit_date,
+                exit_price, quantity, pnl, return_pct, exit_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            parameters,
+        )
+    return len(parameters)
+
+
+def insert_portfolio_snapshots(
+    backtest_id: int,
+    snapshots: Sequence[Any],
+    database_path: Optional[DatabasePath] = None,
+) -> int:
+    """Persist end-of-day portfolio snapshots."""
+    parameters = [
+        (
+            backtest_id,
+            snapshot.snapshot_date,
+            snapshot.cash,
+            snapshot.holdings_value,
+            snapshot.total_value,
+            snapshot.drawdown,
+        )
+        for snapshot in snapshots
+    ]
+    if not parameters:
+        return 0
+    with get_connection(database_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO portfolio_snapshots (
+                backtest_id, snapshot_date, cash, holdings_value, total_value, drawdown
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            parameters,
+        )
+    return len(parameters)
+
+
+def get_backtest_run(backtest_id: int, database_path: Optional[DatabasePath] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve one saved backtest run."""
+    with get_connection(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT backtest_id, strategy, start_date, end_date, starting_capital,
+                   ending_capital, parameters_json, created_at
+            FROM backtest_runs
+            WHERE backtest_id = ?
+            """,
+            (backtest_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_backtest_trades(backtest_id: int, database_path: Optional[DatabasePath] = None) -> List[Dict[str, Any]]:
+    """Retrieve trades for a saved backtest run."""
+    with get_connection(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT trade_id, backtest_id, ticker, signal_date, entry_date, entry_price,
+                   exit_date, exit_price, quantity, pnl, return_pct, exit_reason
+            FROM backtest_trades
+            WHERE backtest_id = ?
+            ORDER BY trade_id
+            """,
+            (backtest_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_portfolio_snapshots(backtest_id: int, database_path: Optional[DatabasePath] = None) -> List[Dict[str, Any]]:
+    """Retrieve portfolio snapshots for a saved backtest run."""
+    with get_connection(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT backtest_id, snapshot_date, cash, holdings_value, total_value, drawdown
+            FROM portfolio_snapshots
+            WHERE backtest_id = ?
+            ORDER BY snapshot_date
+            """,
+            (backtest_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]

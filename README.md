@@ -6,7 +6,7 @@ Live brokerage integration, live trading, options, machine learning, dashboards,
 
 ## Current phase
 
-Phase 3A: read-only strategy-data interface, standardized models, reusable technical indicators, and one diagnostic strategy.
+Phase 3B: minimal deterministic historical backtesting and portfolio simulation engine.
 
 Included:
 
@@ -24,6 +24,9 @@ Included:
 - `SignalAction` enum values: `BUY`, `SELL`, `HOLD`
 - Moving average and return indicators
 - Diagnostic moving-average reversion strategy that generates signals only
+- Deterministic next-day-open backtest execution engine
+- Whole-share long-only portfolio simulation
+- Slippage, commissions, maximum positions, daily snapshots, metrics, benchmark returns, and SQLite persistence
 
 ## Project structure
 
@@ -47,15 +50,29 @@ AlgoTradProject/
         moving_averages.py
         returns.py
     backtesting/
+        __init__.py
+        engine.py
+        execution.py
+        metrics.py
         models.py
+    portfolio/
+        __init__.py
+        manager.py
+        position_sizing.py
     strategies/
         base.py
         moving_average_reversion.py
     tests/
+        test_backtest_engine.py
+        test_backtest_metrics.py
+        test_backtest_persistence.py
         test_database.py
+        test_execution.py
         test_indicators.py
         test_market_data.py
         test_moving_average_reversion.py
+        test_portfolio_manager.py
+        test_position_sizing.py
         test_repositories.py
         test_strategy_data.py
     main.py
@@ -64,6 +81,61 @@ AlgoTradProject/
     .gitignore
 ```
 
+
+## Phase 3B backtesting architecture
+
+Phase 3B adds a minimal historical backtesting engine that consumes standardized `Signal` objects from strategies and executes simulated long-only orders against stored SQLite daily prices. It does not download market data during backtests. Missing history should be resolved with `update-prices` before running a backtest.
+
+Core definitions:
+
+- `Signal`: strategy output with ticker, signal date, strategy name, action, score, and reason.
+- `Order`: pending executable instruction with ticker, side (`BUY` or `SELL`), quantity, signal date, execution date, strategy, score, and reason.
+- `Position`: an open long holding with entry date, entry price, quantity, current price, strategy, signal date, entry commission, score, and reason.
+- `Trade`: a completed round trip with entry/exit dates and prices, quantity, gross P&L, net P&L, return percentage, commissions, and exit reason.
+- `PortfolioSnapshot`: end-of-day cash, holdings value, total value, and drawdown.
+
+Daily event order:
+
+1. Identify the current trading date from the union of stored dates for configured tickers.
+2. Execute pending orders scheduled for the current date at the current open.
+3. Mark open positions to market using the current close or most recent prior close.
+4. Evaluate exit signals after the current close.
+5. Evaluate entry signals after the current close.
+6. Rank competing entries by score descending, then ticker ascending.
+7. Schedule accepted orders for the ticker's next available trading-day open.
+8. Record the end-of-day portfolio snapshot.
+
+Signals generated from a close never execute at that same close. This next-day-open rule is intended to prevent same-bar execution and reduce look-ahead bias.
+
+Position sizing uses whole shares only. The engine calculates quantity at execution using current portfolio value, available cash, configured position-size percentage, slippage-adjusted fill price, and commission. It prevents leverage, short selling, fractional shares, duplicate simultaneous positions, and more than the configured maximum number of positions.
+
+Slippage is applied deterministically: buys execute at `open * (1 + slippage_pct)` and sells execute at `open * (1 - slippage_pct)`. Commission is charged once per executed order. If a next-day open is missing or invalid, the order is skipped rather than filled at another price.
+
+At the final backtest date, any open positions are liquidated at the final available close with sell slippage and commission. The exit reason is `OPEN_AT_END_LIQUIDATION`; this is a backtest boundary assumption, not a trading rule.
+
+Performance metrics include starting capital, ending value, total return, trade counts, win rate, average trade return, gross profit/loss, profit factor, maximum drawdown, average holding period, total commissions, and time with capital invested. Optional benchmark return uses an already-stored SQLite ticker and does not change portfolio cash.
+
+Backtest runs persist to existing SQLite tables: `backtest_runs`, `backtest_trades`, and `portfolio_snapshots`. Additional configuration and metrics are stored as sorted JSON in `parameters_json` so the table schema does not need to change.
+
+Run a backtest:
+
+```powershell
+python main.py run-backtest --tickers AAPL MSFT KO F INTC --start-date 2024-01-01 --end-date 2026-06-24 --starting-capital 100000 --maximum-positions 5 --position-size-pct 0.20 --slippage-pct 0.001 --commission 0 --maximum-holding-days 60 --ma-window 20 --entry-distance-pct 0.05 --stop-loss-pct 0.10 --benchmark AAPL
+```
+
+Run without persistence:
+
+```powershell
+python main.py run-backtest --tickers AAPL MSFT --start-date 2024-01-01 --end-date 2026-06-24 --no-persist
+```
+
+View a saved backtest:
+
+```powershell
+python main.py show-backtest BACKTEST_ID
+```
+
+The moving-average reversion strategy remains diagnostic. It is not an investment recommendation. Backtests can be overfit, and historical performance does not guarantee future results. Live trading, paper brokerage integration, options, leverage, short selling, machine learning, and dashboards are not included.
 ## Setup
 
 From the project root:
@@ -173,6 +245,8 @@ Empty downloads can happen for invalid tickers, unsupported symbols, market holi
 If an invalid ticker fails, continue using `db-status` and `show-prices` to inspect any tickers that did update successfully.
 
 All future strategy and backtesting modules should read price history from SQLite through repository functions rather than making their own yfinance calls.
+
+
 
 
 
