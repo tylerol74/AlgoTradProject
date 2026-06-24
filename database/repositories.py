@@ -232,6 +232,39 @@ def get_available_tickers(database_path: Optional[DatabasePath] = None) -> List[
     return [row["ticker"] for row in rows]
 
 
+def get_active_common_stock_tickers(
+    limit: Optional[int] = None,
+    offset: int = 0,
+    database_path: Optional[DatabasePath] = None,
+) -> List[str]:
+    """Return stored active common-stock tickers eligible for Graham auditing."""
+    excluded_terms = ("etf", "fund", "etn", "warrant", "right", "unit", "preferred", "reit")
+    query = [
+        """
+        SELECT ticker
+        FROM securities
+        WHERE COALESCE(is_active, 1) = 1
+          AND LOWER(COALESCE(security_type, 'common stock')) LIKE '%common%'
+        """
+    ]
+    parameters: List[Any] = []
+    for term in excluded_terms:
+        query.append("AND LOWER(COALESCE(security_type, '')) NOT LIKE ?")
+        parameters.append(f"%{term}%")
+    query.append("ORDER BY ticker")
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if limit is not None:
+        query.append("LIMIT ? OFFSET ?")
+        parameters.extend([limit, offset])
+    elif offset:
+        query.append("LIMIT -1 OFFSET ?")
+        parameters.append(offset)
+    with get_connection(database_path) as connection:
+        rows = connection.execute("\n".join(query), parameters).fetchall()
+    return [row["ticker"] for row in rows]
+
+
 def get_trading_dates(
     tickers: Sequence[str],
     start_date: Optional[str] = None,

@@ -366,6 +366,16 @@ Historical shares are selected without present-day leakage:
 
 Zero, negative, NaN, and infinite share counts are rejected. Weighted-average substitutions are warned, filing metadata is retained, and large instant-versus-weighted-average inconsistencies are surfaced as possible split-adjustment warnings. The code does not silently repair split inconsistencies.
 
+Debt is selected through a generalized aggregation hierarchy:
+
+1. direct total debt, when a reliable non-duplicative total-debt fact exists
+2. current debt plus noncurrent debt
+3. short-term borrowings plus long-term debt
+4. long-term debt only, with a caution warning
+5. unavailable, with an explicit data issue
+
+Supported debt components include current debt, noncurrent debt, short-term borrowings, commercial paper, current portions of long-term debt, long-term debt current/noncurrent, notes payable, and documented finance or capital lease liability concepts. The aggregation model prevents double counting by selecting one latest visible fact per component, preserves source concepts, accession numbers, accepted timestamps, forms, and amendment flags, and classifies methods as direct, component-derived, lease-inclusive, long-term-only, or unavailable. Total liabilities are never treated as debt. Lease liabilities are included only when the selected SEC concept or component explicitly contains lease debt, and the method/warnings identify that behavior.
+
 Book value per share is common shareholders' equity divided by point-in-time shares. Preferred equity is subtracted when available. Tangible book value subtracts goodwill and intangible assets only when those values are explicitly known.
 
 Point-in-time rules are mandatory:
@@ -379,6 +389,12 @@ Point-in-time rules are mandatory:
 ## Graham Data Quality and Scoring
 
 Data-quality diagnostics are visible penalties, not a hidden number. Each penalty includes a code, point deduction, affected field, explanation, and source metadata where relevant. The score is `100 - visible penalties`, bounded to 0-100. Penalties cover accepted timestamp gaps, filing-date fallback, annual/basic EPS fallback, share fallback or missing shares, missing preferred equity, missing current assets or liabilities, missing debt, missing goodwill or intangibles, incomplete five-year earnings history, and possible future-data issues.
+
+Audit warnings are classified by severity:
+
+- informational: expected fallbacks such as annual EPS or weighted-average shares
+- caution: incomplete history, long-term-debt-only fallback, filing-date fallback, missing preferred equity, goodwill, or intangibles
+- critical: future-data conflicts, invalid shares, conflicting source facts, unusable equity, or missing required source metadata
 
 The transparent Graham score is 0 to 100:
 
@@ -482,7 +498,72 @@ python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-0
 python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-01 --export-dir .\reports
 ```
 
-The audit output includes one row per ticker with price, EPS, shares, equity, current assets, current liabilities, debt availability, EPS and share methods, five-year earnings-history count, data-quality score, Graham-ready status, primary missing reason, and warning count. It clearly distinguishes missing data from failed eligibility rules.
+The default audit columns are ticker, `data_ready`, `strategy_qualified`, price, EPS method, share method, debt method, earnings years, data-quality score, Graham score, margin of safety, primary data issue, primary disqualification reason, and warning counts by severity. Blank values are rendered as `-`.
+
+`data_ready` means enough valid point-in-time data exists to calculate a meaningful Graham evaluation. `strategy_qualified` means the company passes the configured Graham strategy thresholds and hard rules. A company can be `data_ready=yes` and `strategy_qualified=no`; valuation failure is not a data-readiness failure.
+
+Verbose and filtered audit examples:
+
+```powershell
+python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-01 --verbose
+python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-01 --data-ready-only --sort-by data_quality_score --descending
+python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-01 --qualified-only
+python main.py audit-graham-data --tickers AAPL MSFT KO F INTC --as-of 2025-06-01 --failures-only
+```
+
+Ticker files may be TXT or CSV. Tickers are normalized, duplicates are removed deterministically, and invalid tickers are reported:
+
+```powershell
+python main.py audit-graham-data --ticker-file examples\graham_audit_sample_tickers.txt --as-of 2025-06-01
+```
+
+Stored eligible common-stock universe audit:
+
+```powershell
+python main.py audit-graham-data --universe all-eligible --as-of 2025-06-01 --limit 100 --offset 0
+```
+
+The audit summary reports requested and valid ticker counts, invalid tickers, price/EPS/shares/equity/current-assets/current-liabilities/debt/five-year-history coverage, data-ready and strategy-qualified coverage, average and median data-quality score, top data issues, top disqualification reasons, and warning totals by severity.
+
+Export a missing-data update plan without running updates:
+
+```powershell
+python main.py audit-graham-data --ticker-file examples\graham_audit_sample_tickers.txt --as-of 2025-06-01 --export-dir outputs\graham_audit_20 --export-missing-data-plan
+```
+
+The missing-data plan identifies whether each ticker needs prices, fundamentals, both, or neither, lists missing fields, and prints suggested commands. Audits never auto-download SEC data or yfinance prices.
+
+For a 100-stock workflow in Command Prompt:
+
+```cmd
+python main.py audit-graham-data ^
+--ticker-file planning\audit_universe_100.txt ^
+--as-of 2025-06-01 ^
+--data-ready-only ^
+--sort-by data_quality_score ^
+--descending ^
+--export-dir outputs\graham_audit_100 ^
+--export-missing-data-plan
+```
+
+PowerShell uses backtick continuation:
+
+```powershell
+python main.py audit-graham-data `
+  --ticker-file planning\audit_universe_100.txt `
+  --as-of 2025-06-01 `
+  --data-ready-only `
+  --sort-by data_quality_score `
+  --descending `
+  --export-dir outputs\graham_audit_100 `
+  --export-missing-data-plan
+```
+
+For 300 stored eligible securities:
+
+```powershell
+python main.py audit-graham-data --universe all-eligible --as-of 2025-06-01 --limit 300 --export-dir outputs\graham_audit_300
+```
 
 Run a standalone Graham backtest using next-open execution:
 

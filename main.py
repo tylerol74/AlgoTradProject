@@ -1,10 +1,11 @@
 ﻿"""Command-line entry point for AlgoTradProject."""
 
 import argparse
+import csv
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from backtesting.engine import run_backtest
 from backtesting.models import BacktestConfig
@@ -16,6 +17,7 @@ from configurations.validation import ConfigurationValidationError
 from data.market_data import update_price_universe
 from data import strategy_data as repository_strategy_data
 from database.repositories import (
+    get_active_common_stock_tickers,
     get_backtest_run,
     get_backtest_trades,
     get_database_status,
@@ -34,7 +36,15 @@ from fundamentals.service import (
 from reporting.backtest_report import create_backtest_report
 from reporting.comparison import compare_backtests
 from reporting.exports import export_backtest_report, export_comparison, export_experiment
-from reporting.graham_report import export_graham_evaluations, graham_audit_row, graham_evaluation_to_dict, graham_summary_row
+from reporting.graham_report import (
+    export_graham_evaluations,
+    graham_audit_payload,
+    graham_audit_row,
+    graham_audit_summary,
+    graham_evaluation_to_dict,
+    graham_missing_data_plan,
+    graham_summary_row,
+)
 from strategies.graham_value import GrahamValueStrategy
 from strategies.moving_average_reversion import MovingAverageReversionStrategy
 
@@ -149,11 +159,24 @@ def build_parser() -> argparse.ArgumentParser:
     screen_graham.add_argument("--export-dir", default=None)
 
     audit_graham = subparsers.add_parser("audit-graham-data", help="Audit stored Graham data coverage without downloading")
-    audit_graham.add_argument("--tickers", nargs="+", required=True)
+    audit_source = audit_graham.add_mutually_exclusive_group(required=True)
+    audit_source.add_argument("--tickers", nargs="+")
+    audit_source.add_argument("--ticker-file")
+    audit_source.add_argument("--universe", choices=["all-eligible"])
     audit_graham.add_argument("--as-of", required=True)
     _add_graham_threshold_flags(audit_graham)
     audit_graham.add_argument("--json", action="store_true")
     audit_graham.add_argument("--export-dir", default=None)
+    audit_graham.add_argument("--verbose", action="store_true")
+    audit_graham.add_argument("--qualified-only", action="store_true")
+    audit_graham.add_argument("--data-ready-only", action="store_true")
+    audit_graham.add_argument("--failures-only", action="store_true")
+    audit_graham.add_argument("--sort-by", choices=["ticker", "data_quality_score", "graham_score", "margin_of_safety", "market_cap", "average_dollar_volume"], default=None)
+    audit_graham.add_argument("--descending", action="store_true")
+    audit_graham.add_argument("--limit", type=int, default=None)
+    audit_graham.add_argument("--offset", type=int, default=0)
+    audit_graham.add_argument("--include-missing-data", action="store_true", default=True)
+    audit_graham.add_argument("--export-missing-data-plan", action="store_true")
 
     graham_backtest = subparsers.add_parser("run-graham-backtest", help="Run the standalone Graham backtest")
     graham_backtest.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
@@ -475,38 +498,212 @@ def _screen_graham_command(args: argparse.Namespace) -> None:
             print(f"Exported {path}")
 
 
-def _audit_graham_data_command(args: argparse.Namespace) -> None:
-    strategy = _graham_strategy(args)
-    rows = [graham_audit_row(strategy.evaluate(ticker, args.as_of)) for ticker in args.tickers]
-    if args.json:
-        print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+def _valid_ticker_text(ticker: str) -> bool:
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.")
+    return bool(ticker) and all(char in allowed for char in ticker) and any(char.isalpha() for char in ticker)
+
+
+def _dedupe_tickers(values: List[str]) -> Tuple[List[str], List[str]]:
+    from data.sec_ticker_map import normalize_ticker
+
+    tickers: List[str] = []
+    invalid: List[str] = []
+    seen = set()
+    for value in values:
+        try:
+            normalized = normalize_ticker(value)
+        except ValueError:
+            invalid.append(str(value))
+            continue
+        if not _valid_ticker_text(normalized):
+            invalid.append(str(value))
+            continue
+        if normalized not in seen:
+            tickers.append(normalized)
+            seen.add(normalized)
+    return tickers, invalid
+
+
+def _read_ticker_file(path: str) -> List[str]:
+    file_path = Path(path)
+    suffix = file_path.suffix.lower()
+    if suffix == ".csv":
+        values: List[str] = []
+        with file_path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.reader(handle):
+                values.extend(cell.strip() for cell in row if cell.strip())
+        return values
+    return [line.strip() for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _audit_universe(args: argparse.Namespace) -> Tuple[List[str], List[str], str, int]:
+    if args.tickers:
+        requested, source = list(args.tickers), "tickers"
+    elif args.ticker_file:
+        requested, source = _read_ticker_file(args.ticker_file), "ticker-file"
     else:
-        headers = [
+        requested, source = get_active_common_stock_tickers(limit=args.limit, offset=args.offset), "all-eligible"
+    tickers, invalid = _dedupe_tickers(requested)
+    if args.limit is not None and args.tickers:
+        tickers = tickers[args.offset : args.offset + args.limit]
+    elif args.ticker_file:
+        tickers = tickers[args.offset :]
+        if args.limit is not None:
+            tickers = tickers[: args.limit]
+    return tickers, invalid, source, len(requested)
+
+
+def _sort_audit_rows(rows: List[Dict[str, Any]], sort_by: Optional[str], descending: bool) -> List[Dict[str, Any]]:
+    if not sort_by:
+        return rows
+
+    def key(row: Dict[str, Any]) -> Any:
+        value = row.get(sort_by)
+        return (value is None, value if value is not None else "", row.get("ticker", ""))
+
+    return sorted(rows, key=key, reverse=descending)
+
+
+def _filter_audit_rows(rows: List[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
+    filtered = rows
+    if args.qualified_only:
+        filtered = [row for row in filtered if row.get("strategy_qualified")]
+    if args.data_ready_only:
+        filtered = [row for row in filtered if row.get("data_ready")]
+    if args.failures_only:
+        filtered = [row for row in filtered if not row.get("strategy_qualified")]
+    return filtered
+
+
+def _format_bool(value: Any) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "-"
+
+
+def _format_cell(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, bool):
+        return _format_bool(value)
+    if isinstance(value, float):
+        if abs(value) >= 1_000_000:
+            return f"{value:.0f}"
+        return f"{value:.4g}"
+    if isinstance(value, list):
+        return "; ".join(str(item) for item in value) if value else "-"
+    return str(value)
+
+
+def _print_aligned_table(rows: List[Dict[str, Any]], columns: List[str]) -> None:
+    formatted = [[_format_cell(row.get(column)) for column in columns] for row in rows]
+    widths = [len(column) for column in columns]
+    for line in formatted:
+        for index, cell in enumerate(line):
+            widths[index] = max(widths[index], len(cell))
+    print("  ".join(column.ljust(widths[index]) for index, column in enumerate(columns)))
+    print("  ".join("-" * widths[index] for index, _ in enumerate(columns)))
+    for line in formatted:
+        print("  ".join(cell.ljust(widths[index]) for index, cell in enumerate(line)))
+
+
+def _print_audit_summary(summary: Dict[str, Any]) -> None:
+    def pct(item: Dict[str, Any]) -> str:
+        return f"{item['count']} ({item['percentage']:.1f}%)"
+
+    print()
+    print("Summary:")
+    print(f"  total requested: {summary['total_requested']}")
+    print(f"  valid tickers: {summary['valid_tickers']}")
+    print(f"  invalid tickers: {summary['invalid_tickers']}")
+    print(f"  price coverage: {pct(summary['price_coverage'])}")
+    print(f"  EPS coverage: {pct(summary['eps_coverage'])}")
+    print(f"  shares coverage: {pct(summary['shares_coverage'])}")
+    print(f"  equity coverage: {pct(summary['equity_coverage'])}")
+    print(f"  current-assets coverage: {pct(summary['current_assets_coverage'])}")
+    print(f"  current-liabilities coverage: {pct(summary['current_liabilities_coverage'])}")
+    print(f"  debt coverage: {pct(summary['debt_coverage'])}")
+    print(f"  five-year-history coverage: {pct(summary['five_year_history_coverage'])}")
+    print(f"  data ready: {pct(summary['data_ready'])}")
+    print(f"  strategy qualified: {pct(summary['strategy_qualified'])}")
+    print(f"  average data-quality score: {_format_cell(summary['average_data_quality_score'])}")
+    print(f"  median data-quality score: {_format_cell(summary['median_data_quality_score'])}")
+    print(f"  top data issues: {_format_cell(summary['top_data_issues'])}")
+    print(f"  top disqualification reasons: {_format_cell(summary['top_disqualification_reasons'])}")
+    print(f"  warning totals: {summary['warning_totals']}")
+
+
+def _audit_graham_data_command(args: argparse.Namespace) -> None:
+    tickers, invalid_tickers, universe_source, total_requested = _audit_universe(args)
+    strategy = _graham_strategy(args)
+    rows = [graham_audit_row(strategy.evaluate(ticker, args.as_of)) for ticker in tickers]
+    rows = _filter_audit_rows(rows, args)
+    rows = _sort_audit_rows(rows, args.sort_by, args.descending)
+    summary = graham_audit_summary(rows, invalid_tickers, total_requested)
+    configuration = {
+        "sort_by": args.sort_by,
+        "descending": args.descending,
+        "qualified_only": args.qualified_only,
+        "data_ready_only": args.data_ready_only,
+        "failures_only": args.failures_only,
+        "limit": args.limit,
+        "offset": args.offset,
+    }
+    payload = graham_audit_payload(rows, summary, configuration, args.as_of, universe_source)
+    missing_plan = graham_missing_data_plan(rows)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    else:
+        columns = [
             "ticker",
-            "price_available",
-            "eps_available",
+            "data_ready",
+            "strategy_qualified",
+            "price",
             "eps_method",
-            "shares_available",
             "shares_method",
-            "equity_available",
-            "current_assets_available",
-            "current_liabilities_available",
-            "debt_available",
-            "five_year_earnings_history_count",
+            "debt_method",
+            "earnings_years",
             "data_quality_score",
-            "graham_ready",
-            "primary_missing_reason",
-            "warning_count",
+            "graham_score",
+            "margin_of_safety",
+            "primary_data_issue",
+            "primary_disqualification_reason",
+            "informational_warning_count",
+            "caution_warning_count",
+            "critical_warning_count",
         ]
-        print("\t".join(headers))
-        for row in rows:
-            print("\t".join(str(row.get(header, "")) for header in headers))
+        if args.verbose:
+            columns.extend(
+                [
+                    "price_available",
+                    "eps_available",
+                    "shares_available",
+                    "equity_available",
+                    "current_assets_available",
+                    "current_liabilities_available",
+                    "debt_available",
+                    "market_cap",
+                    "average_dollar_volume",
+                ]
+            )
+        _print_aligned_table(rows, columns)
+        _print_audit_summary(summary)
+        if invalid_tickers:
+            print(f"Invalid tickers: {', '.join(invalid_tickers)}")
     if args.export_dir:
         directory = Path(args.export_dir)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"graham-data-audit-{args.as_of}.json"
-        path.write_text(json.dumps(rows, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
         print(f"Exported {path}")
+        if args.export_missing_data_plan:
+            plan_path = directory / f"graham-missing-data-plan-{args.as_of}.json"
+            plan_path.write_text(json.dumps(missing_plan, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            print(f"Exported {plan_path}")
+    elif args.export_missing_data_plan:
+        print(json.dumps(missing_plan, indent=2, sort_keys=True, default=str))
 
 
 def _run_graham_backtest_command(args: argparse.Namespace) -> None:

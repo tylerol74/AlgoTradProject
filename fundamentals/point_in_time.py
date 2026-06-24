@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from data.sec_ticker_map import CIKMappingError, get_cik_for_ticker, normalize_ticker
 from database.repositories import get_security
+from fundamentals.debt import select_debt
 from fundamentals.earnings import earnings_stability, select_eps
 from fundamentals.normalization import classify_period
 from fundamentals.service import get_fundamental_history, get_fundamentals_as_of
@@ -189,6 +190,24 @@ def build_graham_inputs(ticker: str, evaluation_date: str, strategy_data: Any, f
     shares = share_selection.value
     shares_method = share_selection.method
     warnings.extend(share_selection.warnings)
+    debt_fields = [
+        "total_debt",
+        "debt_current",
+        "debt_noncurrent",
+        "short_term_borrowings",
+        "commercial_paper",
+        "current_portion_of_long_term_debt",
+        "long_term_debt_current",
+        "long_term_debt_noncurrent",
+        "long_term_debt",
+        "finance_lease_liabilities_current",
+        "finance_lease_liabilities_noncurrent",
+        "capital_lease_obligations",
+        "notes_payable",
+    ]
+    debt_rows = {field: history_getter(normalized, field, as_of_date=evaluation_date) for field in debt_fields}
+    debt_selection = select_debt(debt_rows)
+    warnings.extend(debt_selection.warnings)
     market_cap = market_price * shares if market_price is not None and shares is not None else None
     if market_cap is None:
         warnings.append("market cap unavailable")
@@ -208,6 +227,7 @@ def build_graham_inputs(ticker: str, evaluation_date: str, strategy_data: Any, f
         "shares_method": shares_method,
         "shares_source": share_selection.source,
         "eps_selection": eps_selection,
+        "debt_selection": debt_selection,
         "earnings_stability": stability,
     }
     return GrahamInputs(
@@ -224,8 +244,8 @@ def build_graham_inputs(ticker: str, evaluation_date: str, strategy_data: Any, f
         current_liabilities=_field(fields, "current_liabilities"),
         total_assets=_field(fields, "total_assets"),
         total_liabilities=_field(fields, "total_liabilities"),
-        long_term_debt=_field(fields, "long_term_debt"),
-        total_debt=_field(fields, "total_debt"),
+        long_term_debt=_field(fields, "long_term_debt") or _field(fields, "long_term_debt_noncurrent"),
+        total_debt=debt_selection.value,
         shareholders_equity=_field(fields, "shareholders_equity"),
         preferred_equity=_field(fields, "preferred_equity"),
         goodwill=_field(fields, "goodwill"),

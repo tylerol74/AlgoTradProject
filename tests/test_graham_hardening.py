@@ -339,12 +339,14 @@ def test_audit_command_text_json_and_deterministic_output(monkeypatch, capsys):
     main._audit_graham_data_command(args)
     second = capsys.readouterr().out
     assert first == second
-    assert "ticker\tprice_available\teps_available" in first
+    assert "ticker  data_ready" in first
+    assert "strategy_qualified" in first
 
     args = main.parse_args(["audit-graham-data", "--tickers", "AAPL", "--as-of", "2025-06-01", "--json"])
     main._audit_graham_data_command(args)
     payload = json.loads(capsys.readouterr().out)
-    assert payload[0]["ticker"] == "AAPL"
+    assert payload["rows"][0]["ticker"] == "AAPL"
+    assert "summary" in payload
 
 
 def test_source_tables_are_not_mutated_by_audit_style_reads(tmp_path):
