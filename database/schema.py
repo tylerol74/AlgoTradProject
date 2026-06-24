@@ -109,6 +109,59 @@ _SCHEMA_STATEMENTS = (
         FOREIGN KEY (backtest_id) REFERENCES backtest_runs(backtest_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS sec_ticker_map (
+        ticker TEXT PRIMARY KEY,
+        cik TEXT NOT NULL,
+        title TEXT,
+        source TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS fundamental_filings (
+        filing_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL,
+        cik TEXT NOT NULL,
+        accession_number TEXT NOT NULL,
+        form_type TEXT NOT NULL,
+        filing_date TEXT NOT NULL,
+        accepted_at TEXT,
+        report_period TEXT,
+        fiscal_year INTEGER,
+        fiscal_period TEXT,
+        is_amendment INTEGER NOT NULL DEFAULT 0,
+        source_url TEXT,
+        downloaded_at TEXT NOT NULL,
+        UNIQUE(cik, accession_number),
+        FOREIGN KEY (ticker) REFERENCES securities(ticker)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS fundamental_facts (
+        fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filing_id INTEGER NOT NULL,
+        ticker TEXT NOT NULL,
+        taxonomy TEXT NOT NULL,
+        concept TEXT NOT NULL,
+        standardized_field TEXT,
+        unit TEXT,
+        value REAL,
+        period_start TEXT,
+        period_end TEXT,
+        frame TEXT,
+        form_type TEXT,
+        filed_date TEXT,
+        accepted_at TEXT,
+        fiscal_year INTEGER,
+        fiscal_period TEXT,
+        accession_number TEXT,
+        source_name TEXT,
+        downloaded_at TEXT NOT NULL,
+        FOREIGN KEY (filing_id) REFERENCES fundamental_filings(filing_id),
+        UNIQUE(filing_id, taxonomy, concept, unit, period_start, period_end, value)
+    )
+    """,
 )
 
 _INDEX_STATEMENTS = (
@@ -124,6 +177,21 @@ _INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_backtest_trades_ticker ON backtest_trades(ticker)",
     "CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_backtest_id ON portfolio_snapshots(backtest_id)",
     "CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_snapshot_date ON portfolio_snapshots(snapshot_date)",
+    "CREATE INDEX IF NOT EXISTS idx_sec_ticker_map_cik ON sec_ticker_map(cik)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_filings_ticker ON fundamental_filings(ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_filings_cik ON fundamental_filings(cik)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_filings_filing_date ON fundamental_filings(filing_date)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_filings_accepted_at ON fundamental_filings(accepted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_filings_report_period ON fundamental_filings(report_period)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_filings_accession ON fundamental_filings(accession_number)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_filings_ticker_accepted ON fundamental_filings(ticker, accepted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_ticker ON fundamental_facts(ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_filing_id ON fundamental_facts(filing_id)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_accepted_at ON fundamental_facts(accepted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_report_period ON fundamental_facts(period_end)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_standardized_field ON fundamental_facts(standardized_field)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_accession ON fundamental_facts(accession_number)",
+    "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_ticker_field_period ON fundamental_facts(ticker, standardized_field, period_end)",
 )
 
 

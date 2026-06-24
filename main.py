@@ -20,6 +20,12 @@ from database.repositories import (
 from database.schema import initialize_database
 from experiments.models import experiment_config_from_dict
 from experiments.runner import experiment_summary, run_experiment
+from fundamentals.repository import fundamentals_status
+from fundamentals.service import (
+    get_filing_history,
+    get_fundamentals_as_of,
+    update_fundamentals_universe,
+)
 from reporting.backtest_report import create_backtest_report
 from reporting.comparison import compare_backtests
 from reporting.exports import export_backtest_report, export_comparison, export_experiment
@@ -89,6 +95,25 @@ def build_parser() -> argparse.ArgumentParser:
     experiment_parser = subparsers.add_parser("run-experiment", help="Run a JSON-defined development/validation experiment")
     experiment_parser.add_argument("experiment_file")
     experiment_parser.add_argument("--export-dir", default=None)
+
+    fundamentals_parser = subparsers.add_parser("update-fundamentals", help="Download and store SEC fundamentals")
+    fundamentals_parser.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
+    fundamentals_parser.add_argument("--years", type=int, default=None)
+    fundamentals_parser.add_argument("--start-date", default=None)
+    fundamentals_parser.add_argument("--end-date", default=None)
+    fundamentals_parser.add_argument("--force-refresh", action="store_true")
+
+    subparsers.add_parser("fundamentals-status", help="Show SEC fundamentals database status")
+
+    filings_parser = subparsers.add_parser("show-filings", help="Show supported SEC filings for a ticker")
+    filings_parser.add_argument("ticker")
+    filings_parser.add_argument("--start-date", default=None)
+    filings_parser.add_argument("--end-date", default=None)
+    filings_parser.add_argument("--forms", nargs="+", default=None)
+
+    show_fundamentals_parser = subparsers.add_parser("show-fundamentals", help="Show point-in-time fundamentals")
+    show_fundamentals_parser.add_argument("ticker")
+    show_fundamentals_parser.add_argument("--as-of", required=True)
 
     subparsers.add_parser("db-status", help="Show SQLite database status")
     parser.set_defaults(command="init-db")
@@ -249,6 +274,66 @@ def _run_experiment_command(args: argparse.Namespace) -> None:
             print(f"  {path}")
 
 
+def _update_fundamentals_command(args: argparse.Namespace) -> None:
+    initialize_database()
+    summary = update_fundamentals_universe(args.tickers, years=args.years)
+    for item in summary["results"]:
+        error = f" error={item['error']}" if item.get("error") else ""
+        warnings = f" warnings={'; '.join(item['warnings'])}" if item.get("warnings") else ""
+        print(
+            f"{item['ticker']}: {item['status']} cik={item.get('cik')} "
+            f"filings={item['filings_stored']} facts={item['facts_stored']}{warnings}{error}"
+        )
+    print(
+        f"Total: updated={summary['updated']} unmapped={summary['unmapped']} failed={summary['failed']} "
+        f"filings={summary['filings_stored']} facts={summary['facts_stored']}"
+    )
+
+
+def _fundamentals_status_command() -> None:
+    status = fundamentals_status()
+    print(f"Mapped securities: {status['mapped_securities']}")
+    print(f"Filing count: {status['filing_count']}")
+    print(f"Fact count: {status['fact_count']}")
+    print(f"Earliest filing date: {status['earliest_filing_date']}")
+    print(f"Latest filing date: {status['latest_filing_date']}")
+    print(f"Latest accepted timestamp: {status['latest_accepted_at']}")
+    print("Counts by ticker:")
+    for ticker, counts in status["by_ticker"].items():
+        print(f"  {ticker}: filings={counts['filings']} facts={counts['facts']}")
+    if not status["by_ticker"]:
+        print("  (none)")
+
+
+def _show_filings_command(args: argparse.Namespace) -> None:
+    rows = get_filing_history(args.ticker, start_date=args.start_date, end_date=args.end_date, form_types=args.forms)
+    if not rows:
+        print(f"No supported filings found for {args.ticker.upper()}.")
+        return
+    for row in rows:
+        amendment = " amendment" if row["is_amendment"] else ""
+        print(
+            f"{row['filing_date']} {row['form_type']}{amendment} period={row['report_period']} "
+            f"accepted={row['accepted_at']} accession={row['accession_number']}"
+        )
+
+
+def _show_fundamentals_command(args: argparse.Namespace) -> None:
+    result = get_fundamentals_as_of(args.ticker, args.as_of)
+    if not result["fields"]:
+        print(f"No fundamentals found for {args.ticker.upper()} as of {args.as_of}.")
+        return
+    print(f"{result['ticker']} fundamentals as of {result['as_of_date']}:")
+    for field, row in result["fields"].items():
+        fallback = " fallback=filing_date" if row["accepted_at_fallback_used"] else ""
+        amendment = " amendment" if row["is_amendment"] else ""
+        print(
+            f"  {field}: value={row['value']} unit={row['unit']} period={row['report_period']} "
+            f"form={row['form_type']}{amendment} filed={row['filing_date']} "
+            f"accepted={row['accepted_at']} accession={row['accession_number']}{fallback}"
+        )
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     """Run the command-line interface."""
     configure_logging()
@@ -272,6 +357,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         _compare_backtests_command(args)
     elif args.command == "run-experiment":
         _run_experiment_command(args)
+    elif args.command == "update-fundamentals":
+        _update_fundamentals_command(args)
+    elif args.command == "fundamentals-status":
+        _fundamentals_status_command()
+    elif args.command == "show-filings":
+        _show_filings_command(args)
+    elif args.command == "show-fundamentals":
+        _show_fundamentals_command(args)
     elif args.command == "db-status":
         _print_db_status()
 

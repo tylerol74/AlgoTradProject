@@ -1,12 +1,12 @@
 ﻿# AlgoTradProject
 
-AlgoTradProject is a modular Python 3.9-compatible foundation for historical backtesting and eventual paper trading. The current phase adds a read-only strategy foundation on top of the centralized SQLite market-data layer. Daily OHLCV data is still downloaded once and stored in SQLite; strategies and indicators consume stored data only.
+AlgoTradProject is a modular Python 3.9-compatible foundation for historical backtesting and eventual paper trading. The current phase adds a point-in-time SEC fundamentals data layer on top of the centralized SQLite market-data, strategy, backtesting, and reporting foundations. Daily OHLCV behavior is unchanged.
 
 Live brokerage integration, live trading, options, machine learning, dashboards, and full backtesting are intentionally not included yet.
 
 ## Current phase
 
-Phase 3C: saved-backtest review, comparison, attribution, exports, and development/validation experiment reporting.
+Phase 4A: point-in-time historical fundamentals storage for future Graham-style backtesting.
 
 Included:
 
@@ -31,6 +31,11 @@ Included:
 - Multi-run comparison with comparability warnings
 - Explicit development/validation experiment runner without automatic optimization
 - CSV and JSON report exports
+- SEC EDGAR company facts and submissions ingestion
+- Local ticker-to-CIK mapping cache
+- Point-in-time fundamentals queries that filter on `accepted_at <= as_of_date`
+- Preservation of original and amended filings
+- Standardized fundamental fields with source metadata
 
 ## Project structure
 
@@ -140,6 +145,79 @@ python main.py show-backtest BACKTEST_ID
 ```
 
 The moving-average reversion strategy remains diagnostic. It is not an investment recommendation. Backtests can be overfit, and historical performance does not guarantee future results. Live trading, paper brokerage integration, options, leverage, short selling, machine learning, and dashboards are not included.
+
+## Phase 4A fundamentals
+
+Phase 4A stores SEC EDGAR filing metadata and standardized XBRL facts for U.S. public companies. It is designed for future Graham-style research, but no Graham strategy or fundamental-based execution is implemented yet.
+
+Primary source:
+
+- SEC company submissions metadata
+- SEC company facts JSON
+- SEC company ticker mapping
+
+SEC requests require a User-Agent that identifies the application and contact. Configure it locally without committing secrets:
+
+```powershell
+$env:SEC_USER_AGENT = "AlgoTradProject/0.1 your-email@example.com"
+```
+
+The code intentionally fails fast if `SEC_USER_AGENT` is missing. Request pacing and retry settings are configured in `config/settings.py` through environment variables such as `SEC_REQUEST_DELAY_SECONDS`.
+
+Point-in-time rule:
+
+```python
+get_fundamentals_as_of("AAPL", "2024-06-01")
+```
+
+returns only facts from filings publicly available on or before `2024-06-01`. The query filters by `accepted_at <= as_of_date`. If `accepted_at` is missing, it falls back to `filing_date` and marks `accepted_at_fallback_used` in the returned metadata.
+
+Filing date, accepted timestamp, and report period are different:
+
+- `report_period` is the fiscal period covered by the filing.
+- `filing_date` is the SEC filing date.
+- `accepted_at` is the timestamp used for point-in-time availability when present.
+
+Amendments and restatements are preserved. A 10-K/A does not overwrite the original 10-K. Queries before the amendment acceptance date can still return the original filing; queries after the amendment may return amended facts when they supersede the relevant period.
+
+Supported forms initially:
+
+- `10-K`
+- `10-K/A`
+- `10-Q`
+- `10-Q/A`
+
+Unsupported forms such as 8-K, registration statements, foreign issuer forms, and proxy statements are excluded for now.
+
+Standardized fields include revenue, gross profit, operating income, net income, diluted EPS, basic EPS, interest expense, total assets, total liabilities, current assets, current liabilities, cash and equivalents, inventory, accounts receivable, long-term debt, total debt, shareholders equity, retained earnings, operating cash flow, capital expenditures, dividends paid, weighted-average shares, and shares outstanding.
+
+Historical fundamentals are complex. SEC company facts can contain duplicate concepts, amendments, restatements, instant facts, annual facts, quarter facts, and year-to-date facts. Phase 4A stores period start/end and classifies periods, but it does not derive standalone quarterly values from year-to-date facts.
+
+Update fundamentals:
+
+```powershell
+python main.py update-fundamentals --tickers AAPL MSFT KO F INTC --years 5
+```
+
+Show fundamentals status:
+
+```powershell
+python main.py fundamentals-status
+```
+
+Show filings:
+
+```powershell
+python main.py show-filings AAPL --forms 10-K 10-Q
+```
+
+Query point-in-time fundamentals:
+
+```powershell
+python main.py show-fundamentals AAPL --as-of 2025-06-01
+```
+
+Phase 4A does not add brokerage integration, live trading, paper trading, options, leverage, machine learning, dashboards, or a Graham strategy. It also does not use yfinance as the authoritative historical fundamentals source; yfinance fundamentals are not point-in-time reliable enough for this layer.
 ## Setup
 
 From the project root:
