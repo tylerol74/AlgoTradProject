@@ -9,8 +9,8 @@ from typing import List, Optional
 from backtesting.engine import run_backtest
 from backtesting.models import BacktestConfig
 from config.settings import DEFAULT_TEST_TICKERS, LOG_LEVEL
-from configurations.models import GrahamStrategyConfig, UniverseConfig
-from configurations.presets import get_preset, list_presets
+from configurations.models import CombinedStrategyConfig, GrahamStrategyConfig, TechnicalCapitulationConfig, UniverseConfig
+from configurations.presets import get_combined_preset, get_preset, list_presets
 from configurations.serialization import config_from_json, config_to_json
 from configurations.validation import ConfigurationValidationError
 from data.market_data import update_price_universe
@@ -35,6 +35,8 @@ from reporting.backtest_report import create_backtest_report
 from reporting.comparison import compare_backtests
 from reporting.exports import export_backtest_report, export_comparison, export_experiment
 from reporting.graham_report import export_graham_evaluations, graham_audit_row, graham_evaluation_to_dict, graham_summary_row
+from reporting.combined_strategy_report import combined_summary_row, export_combined_evaluations
+from strategies.combined_graham_technical import CombinedGrahamTechnicalStrategy, rank_combined_candidates
 from strategies.graham_value import GrahamValueStrategy
 from strategies.moving_average_reversion import MovingAverageReversionStrategy
 
@@ -49,6 +51,17 @@ def _add_graham_threshold_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--minimum-average-dollar-volume", type=float, default=2_000_000.0)
     parser.add_argument("--exclude-financials", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--exclude-reits", action=argparse.BooleanOptionalAction, default=True)
+
+
+def _add_combined_threshold_flags(parser: argparse.ArgumentParser) -> None:
+    _add_graham_threshold_flags(parser)
+    parser.add_argument("--preset", default=None)
+    parser.add_argument("--minimum-five-day-decline", type=float, default=None)
+    parser.add_argument("--minimum-ten-day-decline", type=float, default=None)
+    parser.add_argument("--minimum-relative-volume", type=float, default=None)
+    parser.add_argument("--maximum-rsi", type=float, default=None)
+    parser.add_argument("--minimum-panic-score", type=float, default=None)
+    parser.add_argument("--confirmation-window-days", type=int, default=None)
 
 
 def configure_logging() -> None:
@@ -170,6 +183,61 @@ def build_parser() -> argparse.ArgumentParser:
     graham_backtest.add_argument("--reevaluation-frequency", default="weekly")
     graham_backtest.add_argument("--benchmark", default=None)
     graham_backtest.add_argument("--no-persist", action="store_true")
+
+    screen_combined = subparsers.add_parser("screen-combined", help="Screen combined Graham plus technical capitulation candidates")
+    source_group = screen_combined.add_mutually_exclusive_group()
+    source_group.add_argument("--tickers", nargs="+", default=None)
+    source_group.add_argument("--ticker-file", default=None)
+    source_group.add_argument("--universe", choices=["all-eligible"], default=None)
+    screen_combined.add_argument("--limit", type=int, default=None)
+    screen_combined.add_argument("--offset", type=int, default=0)
+    screen_combined.add_argument("--as-of", required=True)
+    _add_combined_threshold_flags(screen_combined)
+    screen_combined.add_argument("--qualified-only", action="store_true")
+    screen_combined.add_argument("--sort-by", default="combined_score")
+    screen_combined.add_argument("--descending", action=argparse.BooleanOptionalAction, default=True)
+    screen_combined.add_argument("--json", action="store_true")
+    screen_combined.add_argument("--export-dir", default=None)
+
+    combined_backtest = subparsers.add_parser("run-combined-backtest", help="Run the combined Graham plus technical backtest")
+    source_group = combined_backtest.add_mutually_exclusive_group()
+    source_group.add_argument("--tickers", nargs="+", default=None)
+    source_group.add_argument("--ticker-file", default=None)
+    source_group.add_argument("--universe", choices=["all-eligible"], default=None)
+    combined_backtest.add_argument("--limit", type=int, default=None)
+    combined_backtest.add_argument("--offset", type=int, default=0)
+    combined_backtest.add_argument("--start-date", required=True)
+    combined_backtest.add_argument("--end-date", required=True)
+    combined_backtest.add_argument("--starting-capital", type=float, default=100000.0)
+    combined_backtest.add_argument("--maximum-positions", type=int, default=10)
+    combined_backtest.add_argument("--position-size-pct", type=float, default=0.10)
+    combined_backtest.add_argument("--slippage-pct", type=float, default=0.001)
+    combined_backtest.add_argument("--commission", type=float, default=0.0)
+    _add_combined_threshold_flags(combined_backtest)
+    combined_backtest.add_argument("--maximum-holding-days", type=int, default=504)
+    combined_backtest.add_argument("--stop-loss-pct", type=float, default=None)
+    combined_backtest.add_argument("--benchmark", default=None)
+    combined_backtest.add_argument("--no-persist", action="store_true")
+    combined_backtest.add_argument("--export-dir", default=None)
+
+    compare_strategies = subparsers.add_parser("compare-strategies", help="Run Graham, technical, and combined backtests with identical assumptions")
+    source_group = compare_strategies.add_mutually_exclusive_group()
+    source_group.add_argument("--tickers", nargs="+", default=None)
+    source_group.add_argument("--ticker-file", default=None)
+    source_group.add_argument("--universe", choices=["all-eligible"], default=None)
+    compare_strategies.add_argument("--limit", type=int, default=None)
+    compare_strategies.add_argument("--offset", type=int, default=0)
+    compare_strategies.add_argument("--start-date", required=True)
+    compare_strategies.add_argument("--end-date", required=True)
+    compare_strategies.add_argument("--starting-capital", type=float, default=100000.0)
+    compare_strategies.add_argument("--maximum-positions", type=int, default=10)
+    compare_strategies.add_argument("--position-size-pct", type=float, default=0.10)
+    compare_strategies.add_argument("--slippage-pct", type=float, default=0.001)
+    compare_strategies.add_argument("--commission", type=float, default=0.0)
+    _add_combined_threshold_flags(compare_strategies)
+    compare_strategies.add_argument("--maximum-holding-days", type=int, default=504)
+    compare_strategies.add_argument("--benchmark", default=None)
+    compare_strategies.add_argument("--export-dir", default=None)
 
     subparsers.add_parser("list-strategy-presets", help="List built-in strategy presets")
 
@@ -426,6 +494,84 @@ def _graham_strategy(args: argparse.Namespace) -> GrahamValueStrategy:
     )
 
 
+def _read_ticker_file(path: str) -> List[str]:
+    values = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        ticker = line.strip()
+        if ticker and not ticker.startswith("#"):
+            values.append(ticker.upper())
+    return values
+
+
+def _resolve_cli_tickers(args: argparse.Namespace) -> List[str]:
+    if getattr(args, "ticker_file", None):
+        tickers = _read_ticker_file(args.ticker_file)
+    elif getattr(args, "universe", None):
+        raise ValueError("--universe all-eligible requires the Phase 5A universe repository helpers on this branch")
+    else:
+        tickers = list(args.tickers or DEFAULT_TEST_TICKERS)
+    normalized = []
+    seen = set()
+    for ticker in tickers:
+        value = ticker.strip().upper()
+        if value and value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    offset = max(0, getattr(args, "offset", 0) or 0)
+    limit = getattr(args, "limit", None)
+    sliced = normalized[offset:]
+    return sliced[:limit] if limit is not None else sliced
+
+
+def _combined_config(args: argparse.Namespace) -> CombinedStrategyConfig:
+    base = get_combined_preset(args.preset) if getattr(args, "preset", None) else CombinedStrategyConfig()
+    graham = GrahamStrategyConfig(
+        minimum_margin_of_safety=args.minimum_margin_of_safety,
+        minimum_graham_score=args.minimum_graham_score,
+        minimum_data_quality_score=args.minimum_data_quality_score,
+        minimum_profitable_years=args.minimum_profitable_years,
+        exclude_financials=args.exclude_financials,
+        exclude_reits=args.exclude_reits,
+    )
+    technical = TechnicalCapitulationConfig(
+        minimum_five_day_decline=args.minimum_five_day_decline if args.minimum_five_day_decline is not None else base.technical.minimum_five_day_decline,
+        minimum_ten_day_decline=args.minimum_ten_day_decline if args.minimum_ten_day_decline is not None else base.technical.minimum_ten_day_decline,
+        minimum_relative_volume=args.minimum_relative_volume if args.minimum_relative_volume is not None else base.technical.minimum_relative_volume,
+        maximum_rsi=args.maximum_rsi if args.maximum_rsi is not None else base.technical.maximum_rsi,
+        minimum_panic_score=args.minimum_panic_score if args.minimum_panic_score is not None else base.technical.minimum_panic_score,
+        require_volume_spike=base.technical.require_volume_spike,
+        require_oversold=base.technical.require_oversold,
+        moving_average_window=base.technical.moving_average_window,
+        minimum_distance_below_moving_average=base.technical.minimum_distance_below_moving_average,
+        rsi_window=base.technical.rsi_window,
+        volume_lookback=base.technical.volume_lookback,
+        confirmation_window_days=args.confirmation_window_days if args.confirmation_window_days is not None else base.technical.confirmation_window_days,
+    )
+    return CombinedStrategyConfig(
+        graham=graham,
+        technical=technical,
+        combination_mode=base.combination_mode,
+        graham_weight=base.graham_weight,
+        technical_weight=base.technical_weight,
+        minimum_combined_score=base.minimum_combined_score,
+        require_graham_first=base.require_graham_first,
+        graham_signal_validity_days=base.graham_signal_validity_days,
+        technical_signal_validity_days=base.technical_signal_validity_days,
+    )
+
+
+def _combined_strategy(args: argparse.Namespace) -> CombinedGrahamTechnicalStrategy:
+    config = _combined_config(args)
+    graham_args = argparse.Namespace(**vars(args))
+    strategy = _graham_strategy(graham_args)
+    return CombinedGrahamTechnicalStrategy(
+        config=config,
+        graham_strategy=strategy,
+        maximum_holding_days=getattr(args, "maximum_holding_days", 504),
+        stop_loss_pct=getattr(args, "stop_loss_pct", None),
+    )
+
+
 def _evaluate_graham_command(args: argparse.Namespace) -> None:
     strategy = _graham_strategy(args)
     try:
@@ -532,6 +678,132 @@ def _run_graham_backtest_command(args: argparse.Namespace) -> None:
     _print_backtest_result(result)
 
 
+def _screen_combined_command(args: argparse.Namespace) -> None:
+    try:
+        tickers = _resolve_cli_tickers(args)
+        strategy = _combined_strategy(args)
+    except (ValueError, ConfigurationValidationError) as exc:
+        print(f"Combined screen failed: {exc}")
+        return
+    evaluations = []
+    for ticker in tickers:
+        history = repository_strategy_data.get_ticker_history(ticker, end_date=args.as_of)
+        try:
+            evaluations.append(strategy.evaluate(ticker, args.as_of, history))
+        except Exception as exc:
+            print(f"{ticker}: combined evaluation failed: {exc}")
+    evaluations = rank_combined_candidates(evaluations)
+    rows = [combined_summary_row(evaluation) for evaluation in evaluations]
+    if args.qualified_only:
+        rows = [row for row in rows if row["combined_qualified"]]
+    if args.sort_by and rows and args.sort_by in rows[0]:
+        rows = sorted(rows, key=lambda row: (row.get(args.sort_by) is None, row.get(args.sort_by), row["ticker"]), reverse=args.descending)
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+    else:
+        for row in rows:
+            print(
+                f"{row['ticker']} price={row['price']} graham_ok={row['graham_qualified']} "
+                f"technical_ok={row['technical_qualified']} combined_ok={row['combined_qualified']} "
+                f"graham_score={row['graham_score']} mos={row['margin_of_safety']} "
+                f"five_day={row['five_day_return']} ten_day={row['ten_day_return']} "
+                f"relvol={row['relative_volume']} rsi={row['rsi']} panic={row['panic_score']} "
+                f"combined={row['combined_score']} reason={row['primary_failure_reason'] or '(none)'} "
+                f"warnings={row['warning_count']}"
+            )
+    if args.export_dir:
+        for path in export_combined_evaluations(evaluations, args.export_dir):
+            print(f"Exported {path}")
+
+
+def _run_combined_backtest_command(args: argparse.Namespace) -> None:
+    try:
+        tickers = _resolve_cli_tickers(args)
+        strategy = _combined_strategy(args)
+    except (ValueError, ConfigurationValidationError) as exc:
+        print(f"Combined backtest failed: {exc}")
+        return
+    config = BacktestConfig(
+        "combined_graham_technical_v1",
+        tickers,
+        args.start_date,
+        args.end_date,
+        args.starting_capital,
+        args.maximum_positions,
+        args.position_size_pct,
+        args.slippage_pct,
+        args.commission,
+        args.maximum_holding_days,
+    )
+    try:
+        result = run_backtest(config, strategy, benchmark_ticker=args.benchmark, persist=not args.no_persist)
+    except ValueError as exc:
+        print(f"Combined backtest failed: {exc}")
+        print("Run update-prices and update-fundamentals first; this command does not download missing data.")
+        return
+    _print_backtest_result(result)
+    if args.export_dir:
+        report = {
+            "config": result.config.__dict__,
+            "metrics": result.metrics,
+            "trades": [trade.__dict__ for trade in result.trades],
+        }
+        directory = Path(args.export_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "combined-backtest-result.json"
+        path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        print(f"Exported {path}")
+
+
+def _compare_strategies_command(args: argparse.Namespace) -> None:
+    try:
+        tickers = _resolve_cli_tickers(args)
+        combined = _combined_strategy(args)
+    except (ValueError, ConfigurationValidationError) as exc:
+        print(f"Strategy comparison failed: {exc}")
+        return
+    configs = [
+        BacktestConfig("graham_value_v1", tickers, args.start_date, args.end_date, args.starting_capital, args.maximum_positions, args.position_size_pct, args.slippage_pct, args.commission, args.maximum_holding_days),
+        BacktestConfig("moving_average_reversion", tickers, args.start_date, args.end_date, args.starting_capital, args.maximum_positions, args.position_size_pct, args.slippage_pct, args.commission, args.maximum_holding_days),
+        BacktestConfig("combined_graham_technical_v1", tickers, args.start_date, args.end_date, args.starting_capital, args.maximum_positions, args.position_size_pct, args.slippage_pct, args.commission, args.maximum_holding_days),
+    ]
+    strategies = [
+        _graham_strategy(args),
+        MovingAverageReversionStrategy(maximum_holding_days=args.maximum_holding_days),
+        combined,
+    ]
+    rows = []
+    for config, strategy in zip(configs, strategies):
+        try:
+            result = run_backtest(config, strategy, benchmark_ticker=args.benchmark, persist=False)
+        except ValueError as exc:
+            rows.append({"strategy": config.strategy_name, "error": str(exc)})
+            continue
+        rows.append(
+            {
+                "strategy": config.strategy_name,
+                "total_return": result.metrics.get("total_return_pct"),
+                "annualized_return": result.metrics.get("annualized_return"),
+                "benchmark_return": (result.metrics.get("benchmark") or {}).get("return_pct"),
+                "max_drawdown": result.metrics.get("maximum_drawdown"),
+                "volatility": result.metrics.get("volatility"),
+                "sharpe_ratio": result.metrics.get("sharpe_ratio"),
+                "completed_trades": result.metrics.get("completed_trade_count"),
+                "win_rate": result.metrics.get("win_rate"),
+                "average_trade": result.metrics.get("average_trade_return"),
+                "average_holding_period": result.metrics.get("average_holding_period_days"),
+                "exposure": result.metrics.get("capital_invested_pct_time"),
+            }
+        )
+    print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+    if args.export_dir:
+        directory = Path(args.export_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "strategy-comparison.json"
+        path.write_text(json.dumps(rows, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        print(f"Exported {path}")
+
+
 def _list_strategy_presets_command() -> None:
     for name in list_presets():
         print(name)
@@ -604,6 +876,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         _audit_graham_data_command(args)
     elif args.command == "run-graham-backtest":
         _run_graham_backtest_command(args)
+    elif args.command == "screen-combined":
+        _screen_combined_command(args)
+    elif args.command == "run-combined-backtest":
+        _run_combined_backtest_command(args)
+    elif args.command == "compare-strategies":
+        _compare_strategies_command(args)
     elif args.command == "list-strategy-presets":
         _list_strategy_presets_command()
     elif args.command == "show-strategy-preset":

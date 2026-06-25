@@ -193,6 +193,132 @@ def test_current_database_without_end_date_is_already_current(temp_database, mon
     assert summary["rows_downloaded"] == 0
     assert summary["rows_stored"] == 0
 
+
+def _stored_price_row(ticker, trade_date):
+    return {
+        "ticker": ticker,
+        "trade_date": trade_date,
+        "open": 100.0,
+        "high": 102.0,
+        "low": 99.0,
+        "close": 101.0,
+        "adjusted_close": 101.0,
+        "volume": 1000,
+        "downloaded_at": "2026-06-24T00:00:00+00:00",
+    }
+
+
+def test_current_database_through_explicit_end_date_is_already_current(temp_database, monkeypatch):
+    upsert_security("AAPL")
+    upsert_daily_prices([_stored_price_row("AAPL", "2024-01-05")])
+
+    def fail_download(*args, **kwargs):
+        raise AssertionError("yfinance should not be called when explicit end date is current")
+
+    monkeypatch.setattr(market_data.yf, "download", fail_download)
+
+    summary = update_ticker_prices("AAPL", start_date="2024-01-01", end_date="2024-01-05")
+
+    assert summary["status"] == "already_current"
+    assert summary["start_date"] is None
+    assert summary["rows_downloaded"] == 0
+
+
+def test_current_database_later_than_explicit_end_date_is_already_current(temp_database, monkeypatch):
+    upsert_security("AAPL")
+    upsert_daily_prices([_stored_price_row("AAPL", "2024-01-08")])
+
+    def fail_download(*args, **kwargs):
+        raise AssertionError("yfinance should not be called when stored data is newer than requested")
+
+    monkeypatch.setattr(market_data.yf, "download", fail_download)
+
+    summary = update_ticker_prices("AAPL", start_date="2024-01-01", end_date="2024-01-05")
+
+    assert summary["status"] == "already_current"
+    assert summary["rows_downloaded"] == 0
+
+
+def test_stale_database_downloads_from_day_after_latest(temp_database, monkeypatch):
+    upsert_security("AAPL")
+    upsert_daily_prices([_stored_price_row("AAPL", "2024-01-03")])
+    captured = {}
+
+    def fake_download(ticker, **kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "Open": [101.0],
+                "High": [103.0],
+                "Low": [100.0],
+                "Close": [102.0],
+                "Adj Close": [102.0],
+                "Volume": [2000],
+            },
+            index=pd.to_datetime(["2024-01-04"]),
+        )
+
+    monkeypatch.setattr(market_data.yf, "download", fake_download)
+
+    summary = update_ticker_prices("AAPL", start_date="2024-01-01", end_date="2024-01-05")
+
+    assert summary["status"] == "updated"
+    assert summary["start_date"] == "2024-01-04"
+    assert captured["start"] == "2024-01-04"
+    assert captured["end"] == "2024-01-06"
+
+
+def test_empty_database_performs_normal_download(temp_database, monkeypatch):
+    captured = {}
+
+    def fake_download(ticker, **kwargs):
+        captured.update(kwargs)
+        return make_frame()
+
+    monkeypatch.setattr(market_data.yf, "download", fake_download)
+
+    summary = update_ticker_prices("AAPL", start_date="2024-01-01", end_date="2024-01-03")
+
+    assert summary["status"] == "updated"
+    assert summary["start_date"] == "2024-01-01"
+    assert captured["start"] == "2024-01-01"
+    assert captured["end"] == "2024-01-04"
+
+
+def test_weekend_current_database_without_end_date_is_already_current(temp_database, monkeypatch):
+    friday = date(2024, 1, 5)
+    saturday = date(2024, 1, 6)
+    upsert_security("AAPL")
+    upsert_daily_prices([_stored_price_row("AAPL", friday.isoformat())])
+    monkeypatch.setattr(market_data, "_expected_latest_trade_date", lambda: friday)
+
+    def fail_download(*args, **kwargs):
+        raise AssertionError("yfinance should not be called when Friday data is current on weekend")
+
+    monkeypatch.setattr(market_data.yf, "download", fail_download)
+
+    assert saturday.weekday() == 5
+    summary = update_ticker_prices("AAPL")
+
+    assert summary["status"] == "already_current"
+    assert summary["rows_downloaded"] == 0
+
+
+def test_current_data_summary_is_deterministic(temp_database, monkeypatch):
+    upsert_security("AAPL")
+    upsert_daily_prices([_stored_price_row("AAPL", "2024-01-05")])
+
+    def fail_download(*args, **kwargs):
+        raise AssertionError("yfinance should not be called for current data")
+
+    monkeypatch.setattr(market_data.yf, "download", fail_download)
+
+    first = update_ticker_prices("AAPL", end_date="2024-01-05")
+    second = update_ticker_prices("AAPL", end_date="2024-01-05")
+
+    assert first == second
+
+
 def test_one_failed_ticker_does_not_stop_others(temp_database, monkeypatch):
     def fake_update(ticker, start_date=None, end_date=None):
         if ticker == "BAD":

@@ -3,7 +3,7 @@
 from dataclasses import replace
 from typing import Dict, List
 
-from configurations.models import GrahamStrategyConfig, SavedStrategyConfig, UniverseConfig
+from configurations.models import CombinedStrategyConfig, GrahamStrategyConfig, SavedStrategyConfig, TechnicalCapitulationConfig, UniverseConfig
 
 _PRESETS: Dict[str, SavedStrategyConfig] = {
     "Moderate Graham": SavedStrategyConfig(
@@ -42,6 +42,40 @@ _PRESETS: Dict[str, SavedStrategyConfig] = {
     ),
 }
 
+_COMBINED_PRESETS: Dict[str, CombinedStrategyConfig] = {
+    "Graham + Panic - Moderate": CombinedStrategyConfig(),
+    "Graham + Panic - Strict": CombinedStrategyConfig(
+        graham=GrahamStrategyConfig(
+            minimum_margin_of_safety=0.40,
+            minimum_graham_score=80.0,
+            minimum_data_quality_score=75.0,
+        ),
+        technical=TechnicalCapitulationConfig(
+            minimum_five_day_decline=0.15,
+            minimum_ten_day_decline=0.20,
+            minimum_relative_volume=2.0,
+            maximum_rsi=30.0,
+            minimum_panic_score=9.0,
+            confirmation_window_days=5,
+        ),
+    ),
+    "Graham + Panic - Broad": CombinedStrategyConfig(
+        graham=GrahamStrategyConfig(
+            minimum_margin_of_safety=0.20,
+            minimum_graham_score=65.0,
+            minimum_data_quality_score=60.0,
+        ),
+        technical=TechnicalCapitulationConfig(
+            minimum_five_day_decline=0.07,
+            minimum_ten_day_decline=0.10,
+            minimum_relative_volume=1.3,
+            maximum_rsi=40.0,
+            minimum_panic_score=5.0,
+            confirmation_window_days=15,
+        ),
+    ),
+}
+
 
 def list_presets() -> List[str]:
     """Return available preset names in deterministic order."""
@@ -61,6 +95,24 @@ def get_preset(name: str) -> SavedStrategyConfig:
         portfolio=replace(preset.portfolio),
         execution=replace(preset.execution),
         backtest=replace(preset.backtest),
+    )
+
+
+def list_combined_presets() -> List[str]:
+    """Return available combined-strategy preset names in deterministic order."""
+    return sorted(_COMBINED_PRESETS)
+
+
+def get_combined_preset(name: str) -> CombinedStrategyConfig:
+    """Return a copy of a named combined-strategy preset."""
+    try:
+        preset = _COMBINED_PRESETS[name]
+    except KeyError:
+        raise ValueError(f"Unknown combined strategy preset: {name}")
+    return replace(
+        preset,
+        graham=replace(preset.graham),
+        technical=replace(preset.technical),
     )
 
 

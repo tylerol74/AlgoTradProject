@@ -490,6 +490,80 @@ Run a standalone Graham backtest using next-open execution:
 python main.py run-graham-backtest --tickers AAPL MSFT KO F INTC --start-date 2024-01-01 --end-date 2025-06-01
 ```
 
+## Market-Data Freshness Repair
+
+`update_ticker_prices()` checks stored daily prices before calling yfinance. If the latest stored `trade_date` is on or after the requested `--end-date`, the update returns `already_current` and does not download. When no end date is supplied, the expected latest date is the current local date adjusted back over weekends, so a current stored row avoids an unnecessary live request. The updater also rejects invalid missing ranges where the computed download start is after the effective end date.
+
+## Phase 4C Combined Graham + Technical Capitulation
+
+Phase 4C adds a read-only combined strategy that requires Graham value qualification and a technical capitulation event. It does not download data, call SEC, call yfinance, place trades directly, or change strategy thresholds automatically. Signals still execute only through the existing next-day-open backtester.
+
+Default combined entry requirements:
+
+- Graham evaluation is qualified
+- margin of safety is at least 30%
+- Graham score is at least 70
+- data-quality score is at least 60
+- 5-trading-day price decline is at least 10%
+- 10-trading-day price decline is at least 15%
+- relative volume is at least 1.5
+- RSI is at or below 35 when oversold confirmation is required
+- technical panic score is at least 7
+- technical confirmation occurs within 10 trading days of Graham qualification
+
+Technical metrics are calculated point-in-time from stored daily prices on or before the evaluation date:
+
+- 1-day, 5-day, 10-day, and 20-day returns
+- RSI
+- current volume, average volume, and relative volume
+- 20-day moving average and distance below that average
+- recent volatility
+- opening gap where prior close is available
+
+The panic score is transparent and uses five components worth 0 to 3 points each:
+
+- 5-day decline: 5%, 10%, and 15% bands
+- 10-day decline: 8%, 15%, and 25% bands
+- relative volume: 1.2x, 1.5x, and 2.0x bands
+- RSI: 40, 35, and 25 bands
+- distance below moving average: 3%, 5%, and 10% bands
+
+The technical score is normalized as `panic_score / 15 * 100` for combined scoring. Default combined weights are 60% Graham and 40% technical. Supported combination modes are `both_required`, `graham_required_technical_confirms`, and `weighted_composite`.
+
+Combined presets:
+
+- Graham + Panic - Moderate
+- Graham + Panic - Strict
+- Graham + Panic - Broad
+
+Screen examples:
+
+```powershell
+python main.py screen-combined --tickers AAPL MSFT KO F INTC --as-of 2025-06-01
+python main.py screen-combined --ticker-file .\tickers.txt --as-of 2025-06-01 --qualified-only --json --export-dir .\reports
+```
+
+Backtest and comparison examples:
+
+```powershell
+python main.py run-combined-backtest --tickers AAPL MSFT KO F INTC --start-date 2024-01-01 --end-date 2025-06-01 --no-persist
+python main.py compare-strategies --tickers AAPL MSFT KO F INTC --start-date 2024-01-01 --end-date 2025-06-01 --benchmark SPY --export-dir .\reports
+```
+
+Exit support preserves Graham exits and adds optional technical recovery behavior. Supported exit reasons include `FAIR_VALUE_REACHED`, `MARGIN_OF_SAFETY_DERIORATED`, `FUNDAMENTAL_DETERIORATION`, `TECHNICAL_RECOVERY`, `MAXIMUM_HOLDING_PERIOD`, `STOP_LOSS`, and `OPEN_AT_END_LIQUIDATION`.
+
+When more candidates exist than portfolio capacity, ranking is deterministic: combined score, margin of safety, Graham score, panic score, average dollar volume, then ticker.
+
+Point-in-time protections:
+
+- strategy code uses only stored prices on or before the evaluation date
+- strategy code does not download prices or fundamentals
+- same-day close signals are only eligible for next-day-open execution
+- Graham evaluation continues to use point-in-time SEC fundamentals
+- source price and fundamental tables are not mutated by screening or strategy evaluation
+
+Limitations: technical capitulation does not guarantee recovery, and one historical backtest should not be treated as proof of superiority. Do not optimize thresholds based on a single comparison run. There is no broker integration, paper trading API, Streamlit UI, live trading, options, short selling, leverage, or intraday execution.
+
 Configurable CLI thresholds include:
 
 ```powershell
@@ -515,7 +589,7 @@ python main.py validate-strategy-config moderate-graham.json
 
 ## Graham Limitations
 
-Version 1 excludes financial companies and REITs by default. It does not support brokerage integration, Streamlit, paper trading, options, short selling, leverage, machine learning, automated parameter optimization, intraday trading, financial-sector valuation, REIT valuation, warrants, preferred-share valuation, or Graham plus technical combined strategies.
+Version 1 excludes financial companies and REITs by default. It does not support brokerage integration, Streamlit, paper trading, options, short selling, leverage, machine learning, automated parameter optimization, intraday trading, financial-sector valuation, REIT valuation, warrants, or preferred-share valuation. The Phase 4C combined strategy is a stored-data research/backtest strategy only.
 
 SEC company facts vary by issuer. Some companies report unusual concepts, restatements, fiscal calendars, 52/53-week years, missing preferred equity, incomplete goodwill or intangible detail, or YTD-only interim facts. The Graham backend rejects unsafe TTM EPS construction instead of guessing, and it reports warnings or data-quality penalties when issuer facts are incomplete or ambiguous.
 
