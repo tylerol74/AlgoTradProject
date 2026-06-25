@@ -554,6 +554,56 @@ Strategy comparison uses identical requested ticker inputs across Graham-only, t
 
 Known limitations: SEC and market-data updates require external access and a valid SEC user agent where applicable. Audits and screens do not auto-download missing data. Small trade counts are not evidence of strategy superiority, and thresholds must not be optimized from one validation run.
 
+## Phase 4D Robustness Validation
+
+Phase 4D adds stored-data validation workflows for development/holdout separation, multi-period checks, nearby-parameter sensitivity, trade-count diagnostics, fair strategy comparison, legacy-behavior review, and practical shortlists. These tools are descriptive. They do not optimize thresholds and do not prove future profitability.
+
+Development and holdout validation:
+
+```powershell
+python main.py validate-strategy --strategy combined --ticker-file outputs\combined_validation\eligible-universe-100.txt --development-start 2025-01-01 --development-end 2025-03-31 --holdout-start 2025-04-01 --holdout-end 2025-06-01 --benchmark SPY --json --export-dir outputs\validation
+```
+
+Development and holdout periods must not overlap, and development must end before holdout starts. Holdout results are reported separately and must not be used to tune thresholds.
+
+Multi-period validation:
+
+```powershell
+python main.py validate-across-periods --strategy combined --ticker-file outputs\combined_validation\eligible-universe-100.txt --periods-file periods.json --benchmark SPY --json --export-dir outputs\validation
+```
+
+The periods file can be JSON or CSV and must include `name`, `start_date`, `end_date`, `type`, and `description`. Missing historical coverage is reported; the framework does not fabricate unavailable market regimes.
+
+Nearby-value sensitivity:
+
+```powershell
+python main.py run-sensitivity-analysis --strategy combined --ticker-file outputs\combined_validation\eligible-universe-100.txt --start-date 2025-01-01 --end-date 2025-06-01 --parameter minimum_panic_score --json
+```
+
+Sensitivity changes one parameter at a time and classifies results as `stable`, `moderately sensitive`, `highly sensitive`, or `insufficient evidence`. It reports trade-count and return differences but does not select a winner.
+
+Trade-count sufficiency labels:
+
+- 0-4: insufficient
+- 5-19: very limited
+- 20-49: limited
+- 50-99: moderate
+- 100+: stronger sample
+
+Fair strategy comparison requires identical requested ticker lists, date ranges, capital, position sizing, slippage, commission, and benchmark. The comparison reports requested, evaluated, skipped, and missing-data counts so strategies are not silently compared on different universes.
+
+Shortlist workflow:
+
+```powershell
+python main.py shortlist-opportunities --strategy combined --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --top 25 --json --export-dir outputs\shortlists
+```
+
+Shortlist ranking is transparent. Component scores include Graham score, margin of safety, panic score, relative volume/liquidity, data quality, and combined score. Hard-disqualified or missing-data rows cannot become actionable because of rank. Ties are deterministic, with ticker ascending as the final tie-break. A zero-candidate shortlist is not automatically an error when the inputs were evaluated and failed documented rules.
+
+Survivorship-bias limitations are documented in `docs/survivorship_bias_review.md`. Current active tickers may be used for historical tests unless a historical ticker file is supplied, so results should not be described as survivorship-bias-free.
+
+Legacy comparison findings are documented in `docs/legacy_strategy_comparison.md`. The legacy project used direct downloads, CSV batch files, and opaque opportunity scores. The new system preserves the useful panic, volume, value, and watchlist concepts through stored-data workflows, transparent scoring, and deterministic ranking.
+
 
 
 
