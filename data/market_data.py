@@ -2,7 +2,7 @@
 
 import logging
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import yfinance as yf
@@ -114,6 +114,22 @@ def _normalize_yfinance_frame(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return normalized.rename(columns=rename_map)
 
 
+def _split_batch_frame(frame: pd.DataFrame, tickers: Sequence[str]) -> Dict[str, pd.DataFrame]:
+    if frame is None or frame.empty:
+        return {}
+    if not isinstance(frame.columns, pd.MultiIndex):
+        return {normalize_ticker(tickers[0]): frame} if len(tickers) == 1 else {}
+    result: Dict[str, pd.DataFrame] = {}
+    normalized = [normalize_ticker(ticker) for ticker in tickers]
+    for level in range(frame.columns.nlevels):
+        values = [normalize_ticker(str(value)) for value in frame.columns.get_level_values(level)]
+        for ticker in normalized:
+            if ticker in values and ticker not in result:
+                actual = frame.columns.get_level_values(level)[values.index(ticker)]
+                result[ticker] = frame.xs(actual, axis=1, level=level, drop_level=True).copy()
+    return result
+
+
 def _rows_from_frame(frame: pd.DataFrame, ticker: str, downloaded_at: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     rows: List[Dict[str, Any]] = []
     validation_errors: List[Dict[str, Any]] = []
@@ -182,6 +198,37 @@ def download_price_history(
             "; ".join(error["errors"]),
         )
     return rows
+
+
+def download_price_history_batch(
+    tickers: Sequence[str],
+    start_date: str,
+    end_date: Optional[str] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Download and validate daily OHLCV rows for multiple tickers in one yfinance call."""
+    normalized = [normalize_ticker(ticker) for ticker in tickers if normalize_ticker(ticker)]
+    if not normalized:
+        return {}
+    if len(normalized) == 1:
+        return {normalized[0]: download_price_history(normalized[0], start_date, end_date)}
+    logger.info("Downloading %s tickers from %s to %s", len(normalized), start_date, end_date or "latest")
+    frame = yf.download(
+        " ".join(normalized),
+        start=start_date,
+        end=_exclusive_yfinance_end_date(end_date),
+        progress=False,
+        auto_adjust=YFINANCE_AUTO_ADJUST,
+        group_by="ticker",
+        threads=True,
+    )
+    downloaded_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    result: Dict[str, List[Dict[str, Any]]] = {ticker: [] for ticker in normalized}
+    for ticker, ticker_frame in _split_batch_frame(frame, normalized).items():
+        rows, validation_errors = _rows_from_frame(ticker_frame, ticker, downloaded_at)
+        for error in validation_errors:
+            logger.warning("Skipping invalid price row for %s on %s: %s", ticker, error["trade_date"], "; ".join(error["errors"]))
+        result[ticker] = rows
+    return result
 
 
 def update_ticker_prices(
@@ -256,13 +303,56 @@ def update_price_universe(
     """Update prices for a list of tickers without one failure stopping the run."""
     effective_batch_size = batch_size or DEFAULT_BATCH_SIZE
     summaries: List[Dict[str, Any]] = []
-    normalized_tickers = [normalize_ticker(ticker) for ticker in tickers]
+    normalized_tickers = [normalize_ticker(ticker) for ticker in tickers if normalize_ticker(ticker)]
+    effective_end_date = end_date or _expected_latest_trade_date().isoformat()
+    pending: List[Dict[str, Any]] = []
+    for ticker in normalized_tickers:
+        summary: Dict[str, Any] = {"ticker": ticker, "status": "failed", "rows_downloaded": 0, "rows_stored": 0, "start_date": None, "end_date": end_date, "error": None}
+        try:
+            latest_date = get_latest_price_date(ticker)
+            if latest_date and _parse_iso_date(latest_date) >= _parse_iso_date(effective_end_date):
+                summary["status"] = "already_current"
+                summaries.append(summary)
+                continue
+            download_start = _next_calendar_day(latest_date) if latest_date else (start_date or DEFAULT_PRICE_HISTORY_START_DATE)
+            if start_date and latest_date and _parse_iso_date(start_date) > _parse_iso_date(download_start):
+                download_start = start_date
+            summary["start_date"] = download_start
+            if _parse_iso_date(download_start) > _parse_iso_date(effective_end_date):
+                summary["status"] = "already_current"
+                summaries.append(summary)
+                continue
+            pending.append(summary)
+        except Exception as exc:
+            summary["error"] = str(exc)
+            summaries.append(summary)
 
-    for index, ticker in enumerate(normalized_tickers, start=1):
-        logger.info("Updating ticker %s (%s/%s)", ticker, index, len(normalized_tickers))
-        summaries.append(update_ticker_prices(ticker, start_date=start_date, end_date=end_date))
-        if effective_batch_size > 0 and index % effective_batch_size == 0:
-            logger.info("Completed batch ending at ticker %s", ticker)
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in pending:
+        grouped.setdefault(str(item["start_date"]), []).append(item)
+    for start_key, group in grouped.items():
+      step = effective_batch_size if effective_batch_size > 0 else len(group)
+      for index in range(0, len(group), step):
+        batch = group[index:index + step]
+        batch_tickers = [item["ticker"] for item in batch]
+        try:
+            for ticker in batch_tickers:
+                upsert_security(ticker, security_type="Equity", is_active=True)
+            downloaded = download_price_history_batch(batch_tickers, start_key, effective_end_date)
+            for item in batch:
+                rows = downloaded.get(item["ticker"], [])
+                item["rows_downloaded"] = len(rows)
+                if rows:
+                    item["rows_stored"] = upsert_daily_prices(rows)
+                    item["status"] = "updated" if item["rows_stored"] else "no_data"
+                else:
+                    item["status"] = "no_data"
+        except Exception as exc:
+            logger.exception("Failed to update price batch %s", batch_tickers)
+            for item in batch:
+                item["status"] = "failed"
+                item["error"] = str(exc)
+        summaries.extend(batch)
 
     return {
         "tickers_requested": len(tickers),

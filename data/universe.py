@@ -159,6 +159,46 @@ def universe_tickers(eligible_only: bool = True, limit: Optional[int] = None, of
     return [row["normalized_ticker"] for row in rows]
 
 
+def production_universe_rows(database_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return the authoritative eligible production universe from SQLite."""
+    return repositories.list_security_universe(eligible_only=True, database_path=database_path)
+
+
+def production_universe_summary(database_path: Optional[str] = None) -> Dict[str, Any]:
+    """Return counts for the stored production universe and exclusions."""
+    status = repositories.security_universe_status(database_path=database_path)
+    rows = repositories.list_security_universe(database_path=database_path)
+    unique_symbols = {row["normalized_ticker"] for row in rows if row.get("normalized_ticker")}
+    malformed = [row for row in rows if not _valid_ticker(row.get("normalized_ticker") or "")]
+    exclusions: Dict[str, int] = {}
+    for row in rows:
+        if row.get("eligibility_status") == "eligible":
+            continue
+        reasons = (row.get("eligibility_reasons") or "unknown").split(";")
+        for reason in reasons:
+            reason = reason.strip() or "unknown"
+            exclusions[reason] = exclusions.get(reason, 0) + 1
+    return {
+        "raw_universe_rows": status["total_securities"],
+        "normalized_unique_symbols": len(unique_symbols),
+        "eligible_securities": status["eligible_graham_securities"],
+        "excluded_by_reason": dict(sorted(exclusions.items())),
+        "malformed_securities": len(malformed),
+    }
+
+
+def export_production_universe(output: str, database_path: Optional[str] = None) -> Dict[str, Any]:
+    """Write the eligible production universe as a deterministic ticker file."""
+    rows = production_universe_rows(database_path=database_path)
+    tickers = sorted({row["normalized_ticker"] for row in rows if row.get("normalized_ticker") and _valid_ticker(row["normalized_ticker"])})
+    path = Path(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(tickers) + ("\n" if tickers else ""), encoding="utf-8")
+    summary = production_universe_summary(database_path=database_path)
+    summary.update({"output": str(path), "exported_tickers": len(tickers)})
+    return summary
+
+
 def run_tracked_batch(
     run_type: str,
     tickers: Sequence[str],

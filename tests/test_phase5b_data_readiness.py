@@ -56,7 +56,7 @@ def _prices(db_path, ticker, start_year=2019, end_year=2025, rows=30):
         for index in range(rows):
             year = start_year if index == 0 else end_year
             month = 1 if index == 0 else 5
-            day = min(index + 1, 28)
+            day = 30 if index == rows - 1 else min(index + 1, 28)
             trade_date = f"{year}-{month:02d}-{day:02d}"
             conn.execute(
                 """
@@ -139,7 +139,7 @@ def test_readiness_classification_missing_required_fields(temp_database):
     _fundamentals(temp_database, "AAA", fields=["diluted_eps"])
     row = build_readiness_report(["AAA"], "2025-06-01", database_path=str(temp_database))["rows"][0]
     assert row["final_readiness_category"] == REQUIRED_GRAHAM_FIELDS_MISSING
-    assert "shareholders_equity" in row["graham_evaluability_reason"]
+    assert "shares_outstanding_or_weighted_average_shares" in row["graham_evaluability_reason"]
 
 
 def test_readiness_classification_unsupported_and_unresolved(temp_database):

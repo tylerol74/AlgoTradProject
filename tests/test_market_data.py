@@ -194,33 +194,34 @@ def test_current_database_without_end_date_is_already_current(temp_database, mon
     assert summary["rows_stored"] == 0
 
 def test_one_failed_ticker_does_not_stop_others(temp_database, monkeypatch):
-    def fake_update(ticker, start_date=None, end_date=None):
-        if ticker == "BAD":
-            return {
-                "ticker": ticker,
-                "status": "failed",
-                "rows_downloaded": 0,
-                "rows_stored": 0,
-                "start_date": start_date,
-                "end_date": end_date,
-                "error": "boom",
-            }
+    def fake_batch(tickers, start_date, end_date=None):
         return {
-            "ticker": ticker,
-            "status": "updated",
-            "rows_downloaded": 1,
-            "rows_stored": 1,
-            "start_date": start_date,
-            "end_date": end_date,
-            "error": None,
+            ticker: (
+                []
+                if ticker == "BAD"
+                else [
+                    {
+                        "ticker": ticker,
+                        "trade_date": "2024-01-02",
+                        "open": 10.0,
+                        "high": 11.0,
+                        "low": 9.0,
+                        "close": 10.0,
+                        "adjusted_close": 10.0,
+                        "volume": 1000,
+                        "downloaded_at": "now",
+                    }
+                ]
+            )
+            for ticker in tickers
         }
 
-    monkeypatch.setattr(market_data, "update_ticker_prices", fake_update)
+    monkeypatch.setattr(market_data, "download_price_history_batch", fake_batch)
 
     summary = update_price_universe(["AAPL", "BAD", "MSFT"], start_date="2024-01-01")
 
     assert summary["updated"] == 2
-    assert summary["failed"] == 1
+    assert summary["no_data"] == 1
     assert [item["ticker"] for item in summary["results"]] == ["AAPL", "BAD", "MSFT"]
 
 
