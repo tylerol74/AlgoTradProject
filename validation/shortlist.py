@@ -54,7 +54,8 @@ def rank_rows(rows: List[Dict[str, Any]], config: OpportunityRankingConfig = Opp
         )
         if hard:
             score = min(score, 0.0)
-        ranked.append(OpportunityRankingResult(row["ticker"], round(score, 6), components, row, bool(row.get("qualified") or row.get("combined_qualified") or row.get("graham_qualified") or row.get("technical_qualified")), hard, 0, "hard disqualified" if hard else "weighted transparent component score"))
+        qualified = bool(row["qualified"]) if "qualified" in row else bool(row.get("combined_qualified") or row.get("graham_qualified") or row.get("technical_qualified"))
+        ranked.append(OpportunityRankingResult(row["ticker"], round(score, 6), components, row, qualified, hard, 0, "hard disqualified" if hard else "weighted transparent component score"))
     ordered = sorted(ranked, key=lambda item: (-item.ranking_score, item.ticker))
     return [OpportunityRankingResult(item.ticker, item.ranking_score, item.component_scores, item.raw_values, item.qualified, item.hard_disqualified, index + 1, item.explanation) for index, item in enumerate(ordered)]
 

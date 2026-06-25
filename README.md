@@ -604,6 +604,43 @@ Survivorship-bias limitations are documented in `docs/survivorship_bias_review.m
 
 Legacy comparison findings are documented in `docs/legacy_strategy_comparison.md`. The legacy project used direct downloads, CSV batch files, and opaque opportunity scores. The new system preserves the useful panic, volume, value, and watchlist concepts through stored-data workflows, transparent scoring, and deterministic ranking.
 
+## Phase 5B Data Readiness
+
+Raw universe size, requested ticker count, ready ticker count, and evaluated ticker count are different numbers. A ticker is only evaluated when it is resolved, eligible, has sufficient stored prices, has SEC filings, has normalized fundamentals, and has the fields needed by the selected strategy. A zero-candidate screen is valid only when every requested ticker is either evaluated or assigned an explicit exclusion, missing-data, invalid, or unsupported reason.
+
+Stored-data readiness report:
+
+```powershell
+python main.py data-readiness-report --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --price-years 6 --export-dir outputs\phase5b
+```
+
+The command does not download data. It exports deterministic JSON and CSV with one row per normalized requested ticker. Categories include `READY`, `PRICE_MISSING`, `PRICE_HISTORY_INSUFFICIENT`, `FUNDAMENTALS_MISSING`, `FUNDAMENTALS_NOT_NORMALIZED`, `REQUIRED_GRAHAM_FIELDS_MISSING`, `UNSUPPORTED_SECURITY`, `INELIGIBLE_SECURITY`, `UNRESOLVED_TICKER`, and `OTHER_EXPLICIT_ERROR`.
+
+Resumable preparation workflow:
+
+```powershell
+$env:SEC_USER_AGENT = "Your Name your.email@example.com"
+python main.py prepare-universe-data --ticker-file outputs\combined_validation\eligible-universe-100.txt --price-years 6 --fundamental-years 6 --price-batch-size 25 --fundamental-batch-size 10 --refresh-normalization --resume --export-dir outputs\phase5b
+```
+
+Preparation checks local readiness first and skips completed ticker/stage combinations. It reuses the existing yfinance price updater and SEC fundamentals service, records stage-level results, preserves successful tickers when another ticker fails, and exports ticker-level failures without secrets or raw HTTP bodies. Reruns are idempotent as long as the underlying update services remain idempotent.
+
+Exact 100-ticker verification workflow:
+
+```powershell
+python main.py data-readiness-report --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --export-dir outputs\phase5b\pre
+python main.py prepare-universe-data --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --resume --refresh-normalization --export-dir outputs\phase5b\prepare
+python main.py data-readiness-report --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --export-dir outputs\phase5b\post
+python main.py universe-coverage-report --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --export-dir outputs\phase5b
+python main.py screen-combined --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --preset "Graham + Panic - Moderate" --export-dir outputs\phase5b
+python main.py run-combined-backtest --ticker-file outputs\combined_validation\eligible-universe-100.txt --start-date 2025-05-01 --end-date 2025-06-01 --no-persist --export-dir outputs\phase5b
+python main.py validate-strategy --strategy combined --ticker-file outputs\combined_validation\eligible-universe-100.txt --development-start 2025-01-02 --development-end 2025-03-31 --holdout-start 2025-04-01 --holdout-end 2025-06-01 --export-dir outputs\phase5b
+```
+
+Inspect failures in the preparation export named `*-failures.csv`. Legitimate SEC/yfinance gaps should remain visible. Do not change thresholds to make readiness or screening results look better.
+
+Known limitations: the workflow cannot make unsupported securities supportable, cannot fabricate issuer facts that SEC does not provide, and cannot prove future profitability. Full-universe preparation can require substantial external API time and should be run in bounded batches, not as an uncontrolled 10,000-security job.
+
 
 
 

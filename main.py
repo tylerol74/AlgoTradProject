@@ -14,6 +14,14 @@ from configurations.presets import get_combined_preset, get_preset, list_presets
 from configurations.serialization import config_from_json, config_to_json
 from configurations.validation import ConfigurationValidationError
 from data.market_data import update_price_universe, update_ticker_prices
+from data.readiness import (
+    build_readiness_report,
+    database_audit_for_tickers,
+    export_preparation_report,
+    export_readiness_report,
+    prepare_universe_data,
+    read_input_symbols,
+)
 from data.universe import (
     build_universe_from_sec_map,
     coverage_freshness,
@@ -289,6 +297,25 @@ def build_parser() -> argparse.ArgumentParser:
     coverage.add_argument("--as-of", default=None)
     coverage.add_argument("--json", action="store_true")
     coverage.add_argument("--export-dir", default=None)
+
+    readiness = subparsers.add_parser("data-readiness-report", help="Report stored-data readiness without downloading")
+    readiness.add_argument("--ticker-file", required=True)
+    readiness.add_argument("--as-of", required=True)
+    readiness.add_argument("--price-years", type=int, default=6)
+    readiness.add_argument("--json", action="store_true")
+    readiness.add_argument("--export-dir", default=None)
+
+    prepare = subparsers.add_parser("prepare-universe-data", help="Resume-safe data preparation for a ticker file")
+    prepare.add_argument("--ticker-file", required=True)
+    prepare.add_argument("--as-of", default=None)
+    prepare.add_argument("--price-years", type=int, default=6)
+    prepare.add_argument("--fundamental-years", type=int, default=6)
+    prepare.add_argument("--price-batch-size", type=int, default=25)
+    prepare.add_argument("--fundamental-batch-size", type=int, default=10)
+    prepare.add_argument("--refresh-normalization", action="store_true")
+    prepare.add_argument("--resume", action="store_true")
+    prepare.add_argument("--json", action="store_true")
+    prepare.add_argument("--export-dir", default=None)
 
     screen_combined = subparsers.add_parser("screen-combined", help="Screen combined Graham plus technical candidates")
     src = screen_combined.add_mutually_exclusive_group()
@@ -806,6 +833,51 @@ def _universe_coverage_report_command(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True, default=str) if args.json else payload)
 
 
+def _data_readiness_report_command(args: argparse.Namespace) -> None:
+    symbols = read_input_symbols(args.ticker_file)
+    payload = build_readiness_report(symbols, args.as_of, price_years=args.price_years)
+    audit = database_audit_for_tickers(symbols, args.as_of, price_years=args.price_years)
+    payload["database_audit"] = audit
+    if args.export_dir:
+        paths = export_readiness_report(payload, args.export_dir)
+        print(f"Exported {paths['json']}")
+        print(f"Exported {paths['csv']}")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+    summary = payload["summary"]
+    reconciliation = payload["reconciliation"]
+    print(f"requested={payload['requested_count']} unique={payload['unique_normalized_count']} ready={summary['ready']}")
+    print(f"price_ready={summary['price_ready']} graham_evaluable={summary['graham_evaluable']} technical_evaluable={summary['technical_evaluable']} combined_evaluable={summary['combined_evaluable']}")
+    print(f"categories={summary['categories']}")
+    print(f"reconciliation_invariant={reconciliation['invariant_holds']} unexplained={reconciliation['unexplained_count']}")
+
+
+def _prepare_universe_data_command(args: argparse.Namespace) -> None:
+    symbols = read_input_symbols(args.ticker_file)
+    payload = prepare_universe_data(
+        symbols,
+        price_years=args.price_years,
+        fundamental_years=args.fundamental_years,
+        as_of=args.as_of,
+        refresh_normalization=args.refresh_normalization,
+        resume=args.resume,
+        export_dir=None,
+    )
+    if args.export_dir:
+        paths = export_preparation_report(payload, args.export_dir)
+        print(f"Exported {paths['json']}")
+        print(f"Exported {paths['failures_csv']}")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+    summary = payload["summary"]
+    print(f"run_identifier={summary['run_identifier']}")
+    print(f"requested={summary['requested_ticker_count']} already_complete={summary['already_complete_count']} final_ready={summary['final_ready_count']} remaining_not_ready={summary['remaining_not_ready_count']}")
+    print(f"attempted_by_stage={summary['attempted_count_by_stage']}")
+    print(f"failed_by_stage={summary['failed_count_by_stage']}")
+
+
 def _evaluate_graham_command(args: argparse.Namespace) -> None:
     strategy = _graham_strategy(args)
     try:
@@ -1045,17 +1117,21 @@ def _run_sensitivity_analysis_command(args: argparse.Namespace) -> None:
 
 def _shortlist_rows(args: argparse.Namespace) -> List[dict]:
     tickers = _source_tickers(args)
+    for name, value in {
+        "minimum_margin_of_safety": 0.30,
+        "minimum_graham_score": 70.0,
+        "minimum_data_quality_score": 60.0,
+        "minimum_profitable_years": 4,
+        "minimum_price": 3.0,
+        "minimum_market_cap": 300_000_000.0,
+        "minimum_average_dollar_volume": 2_000_000.0,
+        "exclude_financials": True,
+        "exclude_reits": True,
+    }.items():
+        if getattr(args, name, None) is None:
+            setattr(args, name, value)
     if args.strategy == "combined":
         for name, value in {
-            "minimum_margin_of_safety": 0.30,
-            "minimum_graham_score": 70.0,
-            "minimum_data_quality_score": 60.0,
-            "minimum_profitable_years": 4,
-            "minimum_price": 3.0,
-            "minimum_market_cap": 300_000_000.0,
-            "minimum_average_dollar_volume": 2_000_000.0,
-            "exclude_financials": True,
-            "exclude_reits": True,
             "minimum_five_day_decline": None,
             "minimum_ten_day_decline": None,
             "minimum_relative_volume": None,
@@ -1063,7 +1139,7 @@ def _shortlist_rows(args: argparse.Namespace) -> List[dict]:
             "minimum_panic_score": args.minimum_panic_score,
             "confirmation_window_days": None,
         }.items():
-            if not hasattr(args, name):
+            if getattr(args, name, None) is None:
                 setattr(args, name, value)
         strategy = _combined_strategy(args)
         rows = []
@@ -1099,13 +1175,16 @@ def _shortlist_rows(args: argparse.Namespace) -> List[dict]:
 
 
 def _shortlist_opportunities_command(args: argparse.Namespace) -> None:
+    margin_filter = args.minimum_margin_of_safety
+    data_quality_filter = args.minimum_data_quality
+    panic_filter = args.minimum_panic_score
     rows = _shortlist_rows(args)
-    if args.minimum_data_quality is not None:
-        rows = [row for row in rows if (row.get("data_quality_score") or 0) >= args.minimum_data_quality]
-    if args.minimum_margin_of_safety is not None:
-        rows = [row for row in rows if (row.get("margin_of_safety") or 0) >= args.minimum_margin_of_safety]
-    if args.minimum_panic_score is not None:
-        rows = [row for row in rows if (row.get("panic_score") or 0) >= args.minimum_panic_score]
+    if data_quality_filter is not None:
+        rows = [row for row in rows if (row.get("data_quality_score") or 0) >= data_quality_filter]
+    if margin_filter is not None:
+        rows = [row for row in rows if (row.get("margin_of_safety") or 0) >= margin_filter]
+    if panic_filter is not None:
+        rows = [row for row in rows if (row.get("panic_score") or 0) >= panic_filter]
     if args.qualified_only and not args.include_failures:
         rows = [row for row in rows if row.get("qualified")]
     ranked = rank_rows(rows)[: args.top]
@@ -1204,6 +1283,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         _refresh_fundamentals_normalization_command(args)
     elif args.command == "universe-coverage-report":
         _universe_coverage_report_command(args)
+    elif args.command == "data-readiness-report":
+        _data_readiness_report_command(args)
+    elif args.command == "prepare-universe-data":
+        _prepare_universe_data_command(args)
     elif args.command == "screen-combined":
         _screen_combined_command(args)
     elif args.command == "run-combined-backtest":

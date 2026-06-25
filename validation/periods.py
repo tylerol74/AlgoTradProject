@@ -41,7 +41,7 @@ def validate_development_holdout(development: ValidationPeriod, holdout: Validat
 def load_periods(path: str) -> List[ValidationPeriod]:
     file_path = Path(path)
     if file_path.suffix.lower() == ".json":
-        payload = json.loads(file_path.read_text(encoding="utf-8"))
+        payload = json.loads(file_path.read_text(encoding="utf-8-sig"))
         rows = payload["periods"] if isinstance(payload, dict) and "periods" in payload else payload
     else:
         with file_path.open(newline="", encoding="utf-8") as handle:
