@@ -3,7 +3,7 @@
 from dataclasses import replace
 from typing import Dict, List
 
-from configurations.models import GrahamStrategyConfig, SavedStrategyConfig, UniverseConfig
+from configurations.models import CombinedStrategyConfig, GrahamStrategyConfig, SavedStrategyConfig, TechnicalCapitulationConfig, UniverseConfig
 
 _PRESETS: Dict[str, SavedStrategyConfig] = {
     "Moderate Graham": SavedStrategyConfig(
@@ -42,6 +42,27 @@ _PRESETS: Dict[str, SavedStrategyConfig] = {
     ),
 }
 
+_COMBINED_PRESETS: Dict[str, CombinedStrategyConfig] = {
+    "Graham + Panic - Moderate": CombinedStrategyConfig(),
+    "Graham + Panic — Moderate": CombinedStrategyConfig(),
+    "Graham + Panic - Strict": CombinedStrategyConfig(
+        graham=GrahamStrategyConfig(0.40, 80.0, 75.0),
+        technical=TechnicalCapitulationConfig(0.15, 0.20, 2.0, 30.0, 9.0, confirmation_window_days=5),
+    ),
+    "Graham + Panic — Strict": CombinedStrategyConfig(
+        graham=GrahamStrategyConfig(0.40, 80.0, 75.0),
+        technical=TechnicalCapitulationConfig(0.15, 0.20, 2.0, 30.0, 9.0, confirmation_window_days=5),
+    ),
+    "Graham + Panic - Broad": CombinedStrategyConfig(
+        graham=GrahamStrategyConfig(0.20, 65.0, 60.0),
+        technical=TechnicalCapitulationConfig(0.07, 0.10, 1.3, 40.0, 5.0, confirmation_window_days=15),
+    ),
+    "Graham + Panic — Broad": CombinedStrategyConfig(
+        graham=GrahamStrategyConfig(0.20, 65.0, 60.0),
+        technical=TechnicalCapitulationConfig(0.07, 0.10, 1.3, 40.0, 5.0, confirmation_window_days=15),
+    ),
+}
+
 
 def list_presets() -> List[str]:
     """Return available preset names in deterministic order."""
@@ -69,3 +90,15 @@ def clone_preset(name: str, new_name: str) -> SavedStrategyConfig:
     if not new_name or not new_name.strip():
         raise ValueError("new_name cannot be blank")
     return replace(get_preset(name), name=new_name.strip())
+
+
+def list_combined_presets() -> List[str]:
+    return sorted(_COMBINED_PRESETS)
+
+
+def get_combined_preset(name: str) -> CombinedStrategyConfig:
+    try:
+        preset = _COMBINED_PRESETS[name]
+    except KeyError:
+        raise ValueError(f"Unknown combined strategy preset: {name}")
+    return replace(preset, graham=replace(preset.graham), technical=replace(preset.technical))

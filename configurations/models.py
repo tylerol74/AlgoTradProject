@@ -15,6 +15,35 @@ class GrahamStrategyConfig:
 
 
 @dataclass(frozen=True)
+class TechnicalCapitulationConfig:
+    minimum_five_day_decline: float = 0.10
+    minimum_ten_day_decline: float = 0.15
+    minimum_relative_volume: float = 1.5
+    maximum_rsi: float = 35.0
+    minimum_panic_score: float = 7.0
+    require_volume_spike: bool = True
+    require_oversold: bool = False
+    moving_average_window: int = 20
+    minimum_distance_below_moving_average: float = 0.05
+    rsi_window: int = 14
+    volume_lookback: int = 20
+    confirmation_window_days: int = 10
+
+
+@dataclass(frozen=True)
+class CombinedStrategyConfig:
+    graham: GrahamStrategyConfig = field(default_factory=GrahamStrategyConfig)
+    technical: TechnicalCapitulationConfig = field(default_factory=TechnicalCapitulationConfig)
+    combination_mode: str = "both_required"
+    graham_weight: float = 0.60
+    technical_weight: float = 0.40
+    minimum_combined_score: float = 70.0
+    require_graham_first: bool = True
+    graham_signal_validity_days: int = 30
+    technical_signal_validity_days: int = 5
+
+
+@dataclass(frozen=True)
 class UniverseConfig:
     minimum_price: float = 3.00
     minimum_market_cap: float = 300_000_000.0

@@ -5,9 +5,10 @@ from datetime import date
 from typing import List, Sequence, Tuple
 
 from data.sec_ticker_map import normalize_ticker
-from configurations.models import SavedStrategyConfig, UniverseConfig
+from configurations.models import CombinedStrategyConfig, SavedStrategyConfig, TechnicalCapitulationConfig, UniverseConfig
 
 SUPPORTED_STRATEGY_TYPES = {"graham_value_v1"}
+SUPPORTED_COMBINATION_MODES = {"both_required", "graham_required_technical_confirms", "weighted_composite"}
 SUPPORTED_CONFIG_VERSIONS = {1}
 
 
@@ -132,3 +133,42 @@ def validated_universe(universe: UniverseConfig) -> UniverseConfig:
     if errors:
         raise ConfigurationValidationError(errors)
     return replace(universe, tickers=normalized)
+
+
+def validate_technical_capitulation_config(config: TechnicalCapitulationConfig) -> List[ValidationError]:
+    errors: List[ValidationError] = []
+    _between(errors, "technical.minimum_five_day_decline", config.minimum_five_day_decline, 0, 1)
+    _between(errors, "technical.minimum_ten_day_decline", config.minimum_ten_day_decline, 0, 1)
+    if config.minimum_relative_volume < 1:
+        errors.append(ValidationError("technical.minimum_relative_volume", "must be at least 1"))
+    _between(errors, "technical.maximum_rsi", config.maximum_rsi, 0, 100)
+    _between(errors, "technical.minimum_panic_score", config.minimum_panic_score, 0, 15)
+    if config.moving_average_window < 2:
+        errors.append(ValidationError("technical.moving_average_window", "must be at least 2"))
+    if config.rsi_window < 2:
+        errors.append(ValidationError("technical.rsi_window", "must be at least 2"))
+    if config.volume_lookback < 2:
+        errors.append(ValidationError("technical.volume_lookback", "must be at least 2"))
+    _between(errors, "technical.minimum_distance_below_moving_average", config.minimum_distance_below_moving_average, 0, 1)
+    if config.confirmation_window_days <= 0:
+        errors.append(ValidationError("technical.confirmation_window_days", "must be positive"))
+    return errors
+
+
+def validate_combined_strategy_config(config: CombinedStrategyConfig) -> List[ValidationError]:
+    errors = validate_technical_capitulation_config(config.technical)
+    _between(errors, "graham.minimum_margin_of_safety", config.graham.minimum_margin_of_safety, 0, 1)
+    _between(errors, "graham.minimum_graham_score", config.graham.minimum_graham_score, 0, 100)
+    _between(errors, "graham.minimum_data_quality_score", config.graham.minimum_data_quality_score, 0, 100)
+    if config.combination_mode not in SUPPORTED_COMBINATION_MODES:
+        errors.append(ValidationError("combination_mode", "unsupported combination mode"))
+    _between(errors, "graham_weight", config.graham_weight, 0, 1)
+    _between(errors, "technical_weight", config.technical_weight, 0, 1)
+    if config.combination_mode == "weighted_composite" and abs((config.graham_weight + config.technical_weight) - 1.0) > 1e-9:
+        errors.append(ValidationError("weights", "must total exactly 1 for weighted mode"))
+    _between(errors, "minimum_combined_score", config.minimum_combined_score, 0, 100)
+    if config.graham_signal_validity_days <= 0:
+        errors.append(ValidationError("graham_signal_validity_days", "must be positive"))
+    if config.technical_signal_validity_days <= 0:
+        errors.append(ValidationError("technical_signal_validity_days", "must be positive"))
+    return errors

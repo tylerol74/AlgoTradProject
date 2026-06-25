@@ -162,6 +162,70 @@ _SCHEMA_STATEMENTS = (
         UNIQUE(filing_id, taxonomy, concept, unit, period_start, period_end, value)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS security_universe (
+        ticker TEXT PRIMARY KEY,
+        normalized_ticker TEXT NOT NULL UNIQUE,
+        company_name TEXT,
+        cik TEXT,
+        exchange TEXT,
+        security_type TEXT,
+        sector TEXT,
+        industry TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        is_common_stock INTEGER NOT NULL DEFAULT 0,
+        is_adr INTEGER NOT NULL DEFAULT 0,
+        is_etf INTEGER NOT NULL DEFAULT 0,
+        is_etn INTEGER NOT NULL DEFAULT 0,
+        is_reit INTEGER NOT NULL DEFAULT 0,
+        is_financial INTEGER NOT NULL DEFAULT 0,
+        is_warrant INTEGER NOT NULL DEFAULT 0,
+        is_right INTEGER NOT NULL DEFAULT 0,
+        is_unit INTEGER NOT NULL DEFAULT 0,
+        is_preferred INTEGER NOT NULL DEFAULT 0,
+        is_otc INTEGER NOT NULL DEFAULT 0,
+        source TEXT,
+        source_updated_at TEXT,
+        first_seen_at TEXT,
+        last_seen_at TEXT,
+        delisted_at TEXT,
+        eligibility_status TEXT,
+        eligibility_reasons TEXT,
+        metadata_json TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingestion_runs (
+        run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_type TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        requested_count INTEGER NOT NULL DEFAULT 0,
+        succeeded_count INTEGER NOT NULL DEFAULT 0,
+        partial_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        configuration_json TEXT,
+        status TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingestion_run_items (
+        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        ticker TEXT NOT NULL,
+        status TEXT NOT NULL,
+        inserted_count INTEGER NOT NULL DEFAULT 0,
+        updated_count INTEGER NOT NULL DEFAULT 0,
+        unchanged_count INTEGER NOT NULL DEFAULT 0,
+        skipped_count INTEGER NOT NULL DEFAULT 0,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        error_type TEXT,
+        error_message TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id)
+    )
+    """,
 )
 
 _INDEX_STATEMENTS = (
@@ -192,6 +256,13 @@ _INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_standardized_field ON fundamental_facts(standardized_field)",
     "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_accession ON fundamental_facts(accession_number)",
     "CREATE INDEX IF NOT EXISTS idx_fundamental_facts_ticker_field_period ON fundamental_facts(ticker, standardized_field, period_end)",
+    "CREATE INDEX IF NOT EXISTS idx_security_universe_eligibility ON security_universe(eligibility_status, normalized_ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_security_universe_exchange ON security_universe(exchange)",
+    "CREATE INDEX IF NOT EXISTS idx_security_universe_type ON security_universe(security_type)",
+    "CREATE INDEX IF NOT EXISTS idx_security_universe_cik ON security_universe(cik)",
+    "CREATE INDEX IF NOT EXISTS idx_ingestion_runs_type ON ingestion_runs(run_type, status)",
+    "CREATE INDEX IF NOT EXISTS idx_ingestion_run_items_run ON ingestion_run_items(run_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_ingestion_run_items_ticker ON ingestion_run_items(ticker)",
 )
 
 

@@ -54,7 +54,15 @@ def _exclusive_yfinance_end_date(end_date: Optional[str]) -> Optional[str]:
 
 
 def _today_iso() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return date.today().isoformat()
+
+
+def _expected_latest_trade_date(reference_date: Optional[date] = None) -> date:
+    """Return the latest expected trading date with lightweight weekend handling."""
+    current = reference_date or date.today()
+    while current.weekday() >= 5:
+        current -= timedelta(days=1)
+    return current
 
 
 def _standard_python_value(value: Any) -> Optional[float]:
@@ -199,6 +207,13 @@ def update_ticker_prices(
 
     try:
         latest_date = get_latest_price_date(normalized)
+        effective_end_date = end_date or _expected_latest_trade_date().isoformat()
+        if latest_date and _parse_iso_date(latest_date) >= _parse_iso_date(effective_end_date):
+            summary["status"] = "already_current"
+            summary["start_date"] = None
+            summary["end_date"] = end_date
+            return summary
+
         download_start = _next_calendar_day(latest_date) if latest_date else (
             start_date or DEFAULT_PRICE_HISTORY_START_DATE
         )
@@ -210,14 +225,13 @@ def update_ticker_prices(
                 download_start = configured_start.isoformat()
 
         summary["start_date"] = download_start
-        effective_end_date = end_date or _today_iso()
         if _parse_iso_date(download_start) > _parse_iso_date(effective_end_date):
             summary["status"] = "already_current"
             summary["end_date"] = end_date
             return summary
 
         upsert_security(normalized, security_type="Equity", is_active=True)
-        rows = download_price_history(normalized, download_start, end_date)
+        rows = download_price_history(normalized, download_start, effective_end_date)
         summary["rows_downloaded"] = len(rows)
 
         if not rows:

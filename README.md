@@ -521,6 +521,39 @@ SEC company facts vary by issuer. Some companies report unusual concepts, restat
 
 The future UI should use the backend configuration models rather than duplicating Graham thresholds.
 
+## Phase 4C.1 Integration Validation
+
+The integrated platform keeps the Phase 5A universe/batch layer and the Phase 4C combined Graham plus technical strategy in the same CLI. Universe commands include `update-universe`, `universe-status`, `list-universe`, `sample-universe`, `update-universe-prices`, `update-universe-fundamentals`, `refresh-fundamentals-normalization`, and `universe-coverage-report`. Combined-strategy commands include `screen-combined`, `run-combined-backtest`, and `compare-strategies`.
+
+Exact 100-ticker workflow:
+
+```powershell
+python main.py update-universe
+python main.py universe-status
+python main.py sample-universe --eligible-only --count 100 --seed 42 --export-dir outputs\combined_validation
+python main.py update-universe-prices --ticker-file outputs\combined_validation\eligible-universe-100.txt --years 6 --batch-size 25
+python main.py update-universe-fundamentals --ticker-file outputs\combined_validation\eligible-universe-100.txt --years 6 --batch-size 10 --refresh-normalization
+python main.py universe-coverage-report --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --export-dir outputs\combined_validation
+python main.py screen-combined --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2025-06-01 --preset "Graham + Panic - Moderate" --export-dir outputs\combined_validation
+```
+
+`screen-combined` reports requested, resolved, and evaluated tickers separately. Its coverage summary distinguishes price-ready, fundamental-ready, Graham-evaluable, technical-evaluable, Graham-qualified, technical-qualified, combined-qualified, missing-data, and excluded counts. A zero-candidate result is not automatically an error; it is only an error when rows are missing without an explicit invalid, unsupported, or missing-data reason.
+
+For larger validation runs, start with a short date range before a long backtest:
+
+```powershell
+python main.py compare-strategies --ticker-file outputs\combined_validation\eligible-universe-100.txt --start-date 2025-05-01 --end-date 2025-06-01 --benchmark SPY
+python main.py run-combined-backtest --ticker-file outputs\combined_validation\eligible-universe-100.txt --start-date 2025-05-01 --end-date 2025-06-01 --no-persist
+```
+
+Safe caching rules: cache keys must include ticker and evaluation date, cached technical inputs must use only prices on or before the evaluation date, and cached Graham inputs must preserve point-in-time filing acceptance. Screening and backtesting must not mutate `daily_prices`, `fundamental_filings`, or `fundamental_facts`.
+
+Performance notes: avoid loading separate price windows for each technical indicator, avoid repeated immutable SEC fact selection where a ticker/date cache is valid, and report ticker count, trading-date count, Graham evaluation count, and technical evaluation count when profiling larger backtests. Do not set machine-dependent hard runtime thresholds.
+
+Strategy comparison uses identical requested ticker inputs across Graham-only, technical-only, and combined runs. It reports requested and evaluated universe counts and skipped tickers so missing data cannot silently change the comparison universe.
+
+Known limitations: SEC and market-data updates require external access and a valid SEC user agent where applicable. Audits and screens do not auto-download missing data. Small trade counts are not evidence of strategy superiority, and thresholds must not be optimized from one validation run.
+
 
 
 
