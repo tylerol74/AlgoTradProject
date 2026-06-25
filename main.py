@@ -1045,17 +1045,21 @@ def _run_sensitivity_analysis_command(args: argparse.Namespace) -> None:
 
 def _shortlist_rows(args: argparse.Namespace) -> List[dict]:
     tickers = _source_tickers(args)
+    for name, value in {
+        "minimum_margin_of_safety": 0.30,
+        "minimum_graham_score": 70.0,
+        "minimum_data_quality_score": 60.0,
+        "minimum_profitable_years": 4,
+        "minimum_price": 3.0,
+        "minimum_market_cap": 300_000_000.0,
+        "minimum_average_dollar_volume": 2_000_000.0,
+        "exclude_financials": True,
+        "exclude_reits": True,
+    }.items():
+        if getattr(args, name, None) is None:
+            setattr(args, name, value)
     if args.strategy == "combined":
         for name, value in {
-            "minimum_margin_of_safety": 0.30,
-            "minimum_graham_score": 70.0,
-            "minimum_data_quality_score": 60.0,
-            "minimum_profitable_years": 4,
-            "minimum_price": 3.0,
-            "minimum_market_cap": 300_000_000.0,
-            "minimum_average_dollar_volume": 2_000_000.0,
-            "exclude_financials": True,
-            "exclude_reits": True,
             "minimum_five_day_decline": None,
             "minimum_ten_day_decline": None,
             "minimum_relative_volume": None,
@@ -1063,7 +1067,7 @@ def _shortlist_rows(args: argparse.Namespace) -> List[dict]:
             "minimum_panic_score": args.minimum_panic_score,
             "confirmation_window_days": None,
         }.items():
-            if not hasattr(args, name):
+            if getattr(args, name, None) is None:
                 setattr(args, name, value)
         strategy = _combined_strategy(args)
         rows = []
@@ -1099,13 +1103,16 @@ def _shortlist_rows(args: argparse.Namespace) -> List[dict]:
 
 
 def _shortlist_opportunities_command(args: argparse.Namespace) -> None:
+    margin_filter = args.minimum_margin_of_safety
+    data_quality_filter = args.minimum_data_quality
+    panic_filter = args.minimum_panic_score
     rows = _shortlist_rows(args)
-    if args.minimum_data_quality is not None:
-        rows = [row for row in rows if (row.get("data_quality_score") or 0) >= args.minimum_data_quality]
-    if args.minimum_margin_of_safety is not None:
-        rows = [row for row in rows if (row.get("margin_of_safety") or 0) >= args.minimum_margin_of_safety]
-    if args.minimum_panic_score is not None:
-        rows = [row for row in rows if (row.get("panic_score") or 0) >= args.minimum_panic_score]
+    if data_quality_filter is not None:
+        rows = [row for row in rows if (row.get("data_quality_score") or 0) >= data_quality_filter]
+    if margin_filter is not None:
+        rows = [row for row in rows if (row.get("margin_of_safety") or 0) >= margin_filter]
+    if panic_filter is not None:
+        rows = [row for row in rows if (row.get("panic_score") or 0) >= panic_filter]
     if args.qualified_only and not args.include_failures:
         rows = [row for row in rows if row.get("qualified")]
     ranked = rank_rows(rows)[: args.top]
