@@ -47,9 +47,15 @@ from reporting.comparison import compare_backtests
 from reporting.exports import export_backtest_report, export_comparison, export_experiment
 from reporting.graham_report import export_graham_evaluations, graham_audit_row, graham_evaluation_to_dict, graham_summary_row
 from reporting.combined_strategy_report import combined_coverage_summary, combined_summary_row, export_combined_evaluations
+from reporting.shortlist_report import export_shortlist_report, shortlist_report
+from reporting.validation_report import export_validation_report, validation_report
 from strategies.combined_graham_technical import CombinedGrahamTechnicalStrategy, rank_combined_candidates
 from strategies.graham_value import GrahamValueStrategy
 from strategies.moving_average_reversion import MovingAverageReversionStrategy
+from validation.comparison import compare_strategies_fair, validate_across_periods, validate_development_holdout_run
+from validation.periods import ValidationPeriod, load_periods
+from validation.sensitivity import DEFAULT_VALUES, run_sensitivity
+from validation.shortlist import rank_rows, shortlist_summary
 
 
 def _add_graham_threshold_flags(parser: argparse.ArgumentParser) -> None:
@@ -338,6 +344,74 @@ def build_parser() -> argparse.ArgumentParser:
     compare_strategies.add_argument("--maximum-holding-days", type=int, default=504)
     compare_strategies.add_argument("--benchmark", default=None)
     compare_strategies.add_argument("--export-dir", default=None)
+
+    validate_strategy = subparsers.add_parser("validate-strategy", help="Run development and holdout validation")
+    validate_strategy.add_argument("--strategy", choices=["graham", "technical", "combined"], required=True)
+    validate_strategy.add_argument("--preset", default=None)
+    src = validate_strategy.add_mutually_exclusive_group(required=True)
+    src.add_argument("--ticker-file", default=None)
+    src.add_argument("--universe", choices=["all-eligible"], default=None)
+    validate_strategy.add_argument("--limit", type=int, default=None)
+    validate_strategy.add_argument("--development-start", required=True)
+    validate_strategy.add_argument("--development-end", required=True)
+    validate_strategy.add_argument("--holdout-start", required=True)
+    validate_strategy.add_argument("--holdout-end", required=True)
+    validate_strategy.add_argument("--benchmark", default=None)
+    validate_strategy.add_argument("--starting-capital", type=float, default=100000.0)
+    validate_strategy.add_argument("--maximum-positions", type=int, default=10)
+    validate_strategy.add_argument("--position-size-pct", type=float, default=0.10)
+    validate_strategy.add_argument("--slippage-pct", type=float, default=0.001)
+    validate_strategy.add_argument("--commission", type=float, default=0.0)
+    validate_strategy.add_argument("--json", action="store_true")
+    validate_strategy.add_argument("--export-dir", default=None)
+
+    validate_periods = subparsers.add_parser("validate-across-periods", help="Validate a strategy across named periods")
+    validate_periods.add_argument("--strategy", choices=["graham", "technical", "combined"], required=True)
+    validate_periods.add_argument("--preset", default=None)
+    src = validate_periods.add_mutually_exclusive_group(required=True)
+    src.add_argument("--ticker-file", default=None)
+    src.add_argument("--universe", choices=["all-eligible"], default=None)
+    validate_periods.add_argument("--limit", type=int, default=None)
+    validate_periods.add_argument("--periods-file", required=True)
+    validate_periods.add_argument("--benchmark", default=None)
+    validate_periods.add_argument("--json", action="store_true")
+    validate_periods.add_argument("--export-dir", default=None)
+
+    sensitivity = subparsers.add_parser("run-sensitivity-analysis", help="Run nearby-value one-parameter sensitivity")
+    sensitivity.add_argument("--strategy", choices=["graham", "technical", "combined"], required=True)
+    sensitivity.add_argument("--preset", default=None)
+    src = sensitivity.add_mutually_exclusive_group(required=True)
+    src.add_argument("--ticker-file", default=None)
+    src.add_argument("--universe", choices=["all-eligible"], default=None)
+    sensitivity.add_argument("--limit", type=int, default=None)
+    sensitivity.add_argument("--start-date", required=True)
+    sensitivity.add_argument("--end-date", required=True)
+    sensitivity.add_argument("--parameter", required=True)
+    sensitivity.add_argument("--values", nargs="+", default=None)
+    sensitivity.add_argument("--benchmark", default=None)
+    sensitivity.add_argument("--json", action="store_true")
+    sensitivity.add_argument("--export-dir", default=None)
+
+    shortlist = subparsers.add_parser("shortlist-opportunities", help="Rank a practical research shortlist")
+    shortlist.add_argument("--strategy", choices=["graham", "technical", "combined"], required=True)
+    shortlist.add_argument("--preset", default=None)
+    src = shortlist.add_mutually_exclusive_group()
+    src.add_argument("--tickers", nargs="+", default=None)
+    src.add_argument("--ticker-file", default=None)
+    src.add_argument("--universe", choices=["all-eligible"], default=None)
+    shortlist.add_argument("--limit", type=int, default=None)
+    shortlist.add_argument("--offset", type=int, default=0)
+    shortlist.add_argument("--as-of", required=True)
+    shortlist.add_argument("--top", type=int, default=25)
+    shortlist.add_argument("--qualified-only", action=argparse.BooleanOptionalAction, default=True)
+    shortlist.add_argument("--include-failures", action="store_true")
+    shortlist.add_argument("--minimum-data-quality", type=float, default=None)
+    shortlist.add_argument("--minimum-margin-of-safety", type=float, default=None)
+    shortlist.add_argument("--minimum-panic-score", type=float, default=None)
+    shortlist.add_argument("--sort-by", default="ranking_score")
+    shortlist.add_argument("--descending", action=argparse.BooleanOptionalAction, default=True)
+    shortlist.add_argument("--json", action="store_true")
+    shortlist.add_argument("--export-dir", default=None)
 
     subparsers.add_parser("list-strategy-presets", help="List built-in strategy presets")
 
@@ -911,6 +985,137 @@ def _compare_strategies_command(args: argparse.Namespace) -> None:
     print(json.dumps(rows, indent=2, sort_keys=True, default=str))
 
 
+def _validation_kwargs(args: argparse.Namespace) -> dict:
+    return {
+        "benchmark": getattr(args, "benchmark", None),
+        "starting_capital": getattr(args, "starting_capital", 100000.0),
+        "maximum_positions": getattr(args, "maximum_positions", 10),
+        "position_size_pct": getattr(args, "position_size_pct", 0.10),
+        "slippage_pct": getattr(args, "slippage_pct", 0.001),
+        "commission": getattr(args, "commission", 0.0),
+        "combined_config": get_combined_preset(args.preset) if getattr(args, "preset", None) else None,
+    }
+
+
+def _validate_strategy_command(args: argparse.Namespace) -> None:
+    tickers = _source_tickers(args)
+    development = ValidationPeriod("development", args.development_start, args.development_end, "development", "")
+    holdout = ValidationPeriod("holdout", args.holdout_start, args.holdout_end, "holdout", "")
+    try:
+        payload = validate_development_holdout_run(args.strategy, tickers, development, holdout, **_validation_kwargs(args))
+    except ValueError as exc:
+        print(f"Validation failed: {exc}")
+        return
+    payload = validation_report(payload)
+    if args.export_dir:
+        print(f"Exported {export_validation_report(payload, args.export_dir)}")
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str) if args.json else payload)
+
+
+def _validate_across_periods_command(args: argparse.Namespace) -> None:
+    tickers = _source_tickers(args)
+    periods = load_periods(args.periods_file)
+    try:
+        payload = validate_across_periods(args.strategy, tickers, periods, **_validation_kwargs(args))
+    except ValueError as exc:
+        print(f"Validation failed: {exc}")
+        return
+    payload = validation_report(payload)
+    if args.export_dir:
+        print(f"Exported {export_validation_report(payload, args.export_dir, 'multi-period-validation.json')}")
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str) if args.json else payload)
+
+
+def _run_sensitivity_analysis_command(args: argparse.Namespace) -> None:
+    tickers = _source_tickers(args)
+    period = ValidationPeriod("sensitivity", args.start_date, args.end_date, "sensitivity", "")
+    values = [float(value) for value in args.values] if args.values else DEFAULT_VALUES.get(args.parameter)
+    if not values:
+        print(f"Sensitivity failed: no documented values for {args.parameter}")
+        return
+    try:
+        payload = run_sensitivity(args.strategy, tickers, period, args.parameter, values, baseline_config=(get_combined_preset(args.preset) if args.preset else CombinedStrategyConfig()), benchmark=args.benchmark)
+    except ValueError as exc:
+        print(f"Sensitivity failed: {exc}")
+        return
+    if args.export_dir:
+        print(f"Exported {export_validation_report(payload, args.export_dir, 'sensitivity-analysis.json')}")
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str) if args.json else payload)
+
+
+def _shortlist_rows(args: argparse.Namespace) -> List[dict]:
+    tickers = _source_tickers(args)
+    if args.strategy == "combined":
+        for name, value in {
+            "minimum_margin_of_safety": 0.30,
+            "minimum_graham_score": 70.0,
+            "minimum_data_quality_score": 60.0,
+            "minimum_profitable_years": 4,
+            "minimum_price": 3.0,
+            "minimum_market_cap": 300_000_000.0,
+            "minimum_average_dollar_volume": 2_000_000.0,
+            "exclude_financials": True,
+            "exclude_reits": True,
+            "minimum_five_day_decline": None,
+            "minimum_ten_day_decline": None,
+            "minimum_relative_volume": None,
+            "maximum_rsi": None,
+            "minimum_panic_score": args.minimum_panic_score,
+            "confirmation_window_days": None,
+        }.items():
+            if not hasattr(args, name):
+                setattr(args, name, value)
+        strategy = _combined_strategy(args)
+        rows = []
+        for ticker in tickers:
+            history = repository_strategy_data.get_ticker_history(ticker, end_date=args.as_of)
+            try:
+                rows.append(combined_summary_row(strategy.evaluate(ticker, args.as_of, history)))
+            except Exception:
+                rows.append({"ticker": ticker, "price": None, "data_ready": False, "combined_qualified": False, "primary_data_issue": "evaluation failed", "primary_combined_failure": "evaluation failed"})
+        for row in rows:
+            row["qualified"] = row.get("combined_qualified", False)
+            row["primary_failure_reason"] = row.get("primary_combined_failure", "")
+            row["data_quality_score"] = row.get("data_quality_score", 0.0)
+        return rows
+    if args.strategy == "graham":
+        strategy = _graham_strategy(args)
+        rows = []
+        for ticker in tickers:
+            try:
+                row = graham_summary_row(strategy.evaluate(ticker, args.as_of))
+                row.update({"qualified": row["qualification_status"] == "QUALIFIED", "panic_score": 0, "relative_volume": None, "rsi": None, "combined_score": row["graham_quality_score"], "primary_data_issue": "", "primary_failure_reason": row["disqualification_reasons"].split("; ")[0] if row["disqualification_reasons"] else ""})
+                rows.append(row)
+            except Exception:
+                rows.append({"ticker": ticker, "qualified": False, "primary_data_issue": "evaluation failed", "primary_failure_reason": "evaluation failed"})
+        return rows
+    rows = []
+    config = TechnicalCapitulationConfig()
+    from strategies.combined_graham_technical import evaluate_technical_capitulation
+    for ticker in tickers:
+        technical = evaluate_technical_capitulation(ticker, args.as_of, repository_strategy_data.get_ticker_history(ticker, end_date=args.as_of), config)
+        rows.append({"ticker": ticker, "price": None, "qualified": technical.qualified, "graham_score": 0, "margin_of_safety": 0, "panic_score": technical.panic_score.total_score, "relative_volume": technical.metrics.relative_volume, "rsi": technical.metrics.rsi, "combined_score": technical.panic_score.total_score / 15 * 100, "data_quality_score": 0, "primary_data_issue": "", "primary_failure_reason": technical.disqualification_reasons[0] if technical.disqualification_reasons else ""})
+    return rows
+
+
+def _shortlist_opportunities_command(args: argparse.Namespace) -> None:
+    rows = _shortlist_rows(args)
+    if args.minimum_data_quality is not None:
+        rows = [row for row in rows if (row.get("data_quality_score") or 0) >= args.minimum_data_quality]
+    if args.minimum_margin_of_safety is not None:
+        rows = [row for row in rows if (row.get("margin_of_safety") or 0) >= args.minimum_margin_of_safety]
+    if args.minimum_panic_score is not None:
+        rows = [row for row in rows if (row.get("panic_score") or 0) >= args.minimum_panic_score]
+    if args.qualified_only and not args.include_failures:
+        rows = [row for row in rows if row.get("qualified")]
+    ranked = rank_rows(rows)[: args.top]
+    summary = shortlist_summary(len(rows), len(rows), len(rows), ranked)
+    payload = shortlist_report(ranked, summary)
+    if args.export_dir:
+        print(f"Exported {export_shortlist_report(ranked, summary, args.export_dir)}")
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str) if args.json else payload)
+
+
 def _list_strategy_presets_command() -> None:
     for name in list_presets():
         print(name)
@@ -1005,6 +1210,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         _run_combined_backtest_command(args)
     elif args.command == "compare-strategies":
         _compare_strategies_command(args)
+    elif args.command == "validate-strategy":
+        _validate_strategy_command(args)
+    elif args.command == "validate-across-periods":
+        _validate_across_periods_command(args)
+    elif args.command == "run-sensitivity-analysis":
+        _run_sensitivity_analysis_command(args)
+    elif args.command == "shortlist-opportunities":
+        _shortlist_opportunities_command(args)
     elif args.command == "list-strategy-presets":
         _list_strategy_presets_command()
     elif args.command == "show-strategy-preset":

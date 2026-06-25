@@ -1,0 +1,13 @@
+# Legacy Strategy Comparison
+
+Legacy path inspected: `C:\Users\tyler\value_screener_sqlite`.
+
+| Legacy file | Legacy behavior | Current equivalent | Meaningful difference | Decision | Rationale |
+| --- | --- | --- | --- | --- | --- |
+| `technical_scanner.py` | Loads Nasdaq Trader files, filters ETFs/test issues/warrants/units/rights, downloads 60 daily bars, and writes batch CSV/SQLite rows. | Phase 5A universe plus stored-price strategy data. | Current system avoids direct strategy downloads and uses central repositories. | improved in new system | Preserves intent while avoiding repeated live calls and CSV source-of-truth. |
+| `technical_scanner.py` | Panic score uses 5-day and 10-day percentage-point declines, volume spike, and liquidity bonus. | Phase 4C transparent panic score uses decimal returns, relative volume, RSI, and moving-average distance. | Legacy liquidity bonus is separate from current panic score; current score is more explainable and point-in-time. | defer | Liquidity is better handled in ranking/shortlist rather than panic itself. |
+| `technical_scanner.py` | `technical_panic_flag` requires panic score >= 7 and 5-day decline <= -10%. | Technical qualification requires configured decline, relative volume, moving-average distance, and panic threshold. | Current logic is stricter and typed. | already preserved | Core panic selloff behavior remains. |
+| `merge_opportunities.py` | Tiered watchlist: Tier 1 Graham plus panic, Tier 2 Graham, Tier 3 panic/oversold, Tier 4 volume/momentum. | `shortlist-opportunities` ranks Graham, technical, and combined rows with visible components. | Current shortlist avoids opaque tiers as the only ranking mechanism. | migrate | Tier intent is represented by ranking reason and qualification fields. |
+| `merge_opportunities.py` | Combined opportunity score blends value, discount, technical panic, liquidity, data quality, and tier bonus. | Opportunity ranking uses visible weighted components and hard disqualification. | Current arithmetic is bounded and explains hard disqualifications. | improved in new system | Avoids legacy opaque score and prevents bad data from ranking as actionable. |
+| `merge_opportunities.py` | Removes bad ticker/security patterns and caps sector/industry concentration. | Universe exclusions plus deterministic ranking. | Historical sector/industry caps are not yet implemented. | defer | Needs point-in-time sector data before applying historical caps. |
+| `run_batch.py` / `run_all_batches.py` | Batch-number files and progress prints. | Ingestion run tables and batch CLI summaries. | Current tracking is centralized. | retire | Batch-number CSV files are no longer the source of truth. |
