@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from config import settings
-from data.market_data import update_ticker_prices
+from data.market_data import update_price_universe, update_ticker_prices
 from data.universe import normalize_ticker_value
 from database.connection import get_connection
 from database import repositories
@@ -34,14 +34,8 @@ STAGES = (
     "READINESS_VERIFIED",
 )
 
-REQUIRED_GRAHAM_FIELDS = {
-    "current_assets",
-    "current_liabilities",
-    "shareholders_equity",
-}
 EPS_FIELDS = {"diluted_eps", "basic_eps"}
 SHARE_FIELDS = {"shares_outstanding", "weighted_average_diluted_shares", "weighted_average_basic_shares"}
-DEBT_FIELDS = {"total_debt", "long_term_debt", "total_liabilities"}
 
 
 @dataclass(frozen=True)
@@ -94,6 +88,13 @@ def _minus_years(value: str, years: int) -> str:
         return parsed.replace(year=parsed.year - years, day=28).isoformat()
 
 
+def _expected_trade_date(value: str) -> str:
+    parsed = date.fromisoformat(value)
+    while parsed.weekday() >= 5:
+        parsed = date.fromordinal(parsed.toordinal() - 1)
+    return parsed.isoformat()
+
+
 def read_input_symbols(path: str) -> List[str]:
     symbols = []
     for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
@@ -127,7 +128,38 @@ def _security_rows(tickers: Sequence[str], database_path: Optional[str] = None) 
             f"SELECT * FROM security_universe WHERE normalized_ticker IN ({placeholders})",
             list(tickers),
         ).fetchall()
-    return {row["normalized_ticker"]: dict(row) for row in rows}
+        result = {row["normalized_ticker"]: dict(row) for row in rows}
+        missing = [ticker for ticker in tickers if ticker not in result]
+        if missing:
+            security_placeholders = ", ".join("?" for _ in missing)
+            securities = connection.execute(
+                f"""
+                SELECT s.ticker, s.ticker AS normalized_ticker, s.company_name, m.cik, s.exchange, s.security_type,
+                       s.is_active, 'eligible' AS eligibility_status, '' AS eligibility_reasons
+                FROM securities AS s
+                LEFT JOIN sec_ticker_map AS m ON m.ticker = s.ticker
+                WHERE s.ticker IN ({security_placeholders})
+                """,
+                missing,
+            ).fetchall()
+            for row in securities:
+                result[row["normalized_ticker"]] = dict(row)
+        still_missing = [ticker for ticker in tickers if ticker not in result]
+        if still_missing:
+            map_placeholders = ", ".join("?" for _ in still_missing)
+            mapped = connection.execute(
+                f"""
+                SELECT ticker, ticker AS normalized_ticker, title AS company_name, cik, NULL AS exchange,
+                       'SEC reporting common equity' AS security_type, 1 AS is_active,
+                       'eligible' AS eligibility_status, '' AS eligibility_reasons
+                FROM sec_ticker_map
+                WHERE ticker IN ({map_placeholders})
+                """,
+                still_missing,
+            ).fetchall()
+            for row in mapped:
+                result[row["normalized_ticker"]] = dict(row)
+    return result
 
 
 def _price_rows(tickers: Sequence[str], as_of: str, database_path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
@@ -200,7 +232,10 @@ def _price_ready(price: Dict[str, Any], as_of: str, price_years: int) -> Tuple[b
     minimum_start = _minus_years(as_of, price_years)
     if not price.get("earliest_price_date") or price["earliest_price_date"] > minimum_start:
         return False, f"stored prices start after required {minimum_start}"
-    if not price.get("latest_price_date") or price["latest_price_date"] > as_of:
+    expected_latest = _expected_trade_date(as_of)
+    if not price.get("latest_price_date") or price["latest_price_date"] < expected_latest:
+        return False, f"latest stored price is before expected {expected_latest}"
+    if price["latest_price_date"] > as_of:
         return False, f"latest stored price is after as-of {as_of}"
     return True, "stored price history covers requested window"
 
@@ -220,20 +255,14 @@ def _graham_ready(fundamentals: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
         return False, "no SEC filings available", []
     if not fields:
         return False, "SEC filings are not normalized into supported fields", []
-    missing = sorted(
-        field
-        for field in REQUIRED_GRAHAM_FIELDS
-        if field not in fields
-    )
+    missing = []
     if not fields.intersection(EPS_FIELDS):
         missing.append("diluted_eps_or_basic_eps")
     if not fields.intersection(SHARE_FIELDS):
         missing.append("shares_outstanding_or_weighted_average_shares")
-    if not fields.intersection(DEBT_FIELDS):
-        missing.append("debt_or_liabilities")
     if missing:
-        return False, "missing required Graham fields: " + ";".join(sorted(set(missing))), sorted(set(missing))
-    return True, "required Graham fields available", []
+        return False, "missing Graham evaluability fields: " + ";".join(sorted(set(missing))), sorted(set(missing))
+    return True, "Graham strategy can evaluate stored price, EPS, shares, and filing facts", []
 
 
 def build_readiness_report(
@@ -396,6 +425,9 @@ def prepare_universe_data(
     refresh_normalization: bool = False,
     resume: bool = False,
     export_dir: Optional[str] = None,
+    price_batch_size: Optional[int] = None,
+    fundamental_batch_size: Optional[int] = None,
+    skip_fundamentals: bool = False,
     price_worker: Callable[[str, Optional[str], Optional[str]], Dict[str, Any]] = update_ticker_prices,
     fundamental_worker: Callable[[str, Optional[int]], Dict[str, Any]] = update_fundamentals_for_ticker,
     database_path: Optional[str] = None,
@@ -405,9 +437,12 @@ def prepare_universe_data(
     before = build_readiness_report(symbols, effective_as_of, price_years, database_path=database_path)
     stage_items: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
+    requested = normalize_requested_symbols(symbols)
+    before_rows = {row["normalized_symbol"]: row for row in before["rows"]}
+    price_candidates: List[str] = []
     for row in before["rows"]:
         ticker = row["normalized_symbol"]
-        if row["security_resolution_status"] != "resolved":
+        if row["eligibility_status"] == "excluded":
             stage_items.append(_stage_item(ticker, "SECURITY_RESOLVED", "failed", row["final_readiness_category"]))
             failures.append(_failure(ticker, "SECURITY_RESOLVED", "unsupported_ticker", "ReadinessError", row["final_readiness_category"], 1, False))
             continue
@@ -415,18 +450,43 @@ def prepare_universe_data(
         if row["price_ready"]:
             stage_items.append(_stage_item(ticker, "PRICE_UPDATE_COMPLETE", "skipped", "already price-ready"))
         else:
+            price_candidates.append(ticker)
+    if price_candidates and price_worker is update_ticker_prices:
+        start = _minus_years(effective_as_of, price_years)
+        batch = update_price_universe(price_candidates, start_date=start, end_date=effective_as_of, batch_size=price_batch_size)
+        for output in batch["results"]:
+            ticker = output["ticker"]
+            status = output.get("status", "updated")
+            if status in {"failed", "no_data"}:
+                message = output.get("error") or status
+                stage_items.append(_stage_item(ticker, "PRICE_UPDATE_COMPLETE", "failed", message, 1))
+                failures.append(_failure(ticker, "PRICE_UPDATE_COMPLETE", "api_or_no_data", "PriceUpdateError", message, 1, True))
+            else:
+                stage_items.append(_stage_item(ticker, "PRICE_UPDATE_COMPLETE", "succeeded", status, 1))
+    elif price_candidates:
+        for ticker in price_candidates:
             try:
                 start = _minus_years(effective_as_of, price_years)
                 output = price_worker(ticker, start, effective_as_of)
                 status = output.get("status", "updated")
-                if status == "failed":
-                    raise RuntimeError(output.get("error") or "price update failed")
+                if status in {"failed", "no_data"}:
+                    raise RuntimeError(output.get("error") or status)
                 stage_items.append(_stage_item(ticker, "PRICE_UPDATE_COMPLETE", "succeeded", status, 1))
             except Exception as exc:
                 stage_items.append(_stage_item(ticker, "PRICE_UPDATE_COMPLETE", "failed", type(exc).__name__, 1))
                 failures.append(_failure(ticker, "PRICE_UPDATE_COMPLETE", "api_or_no_data", type(exc).__name__, str(exc), 1, True))
                 continue
-        if row["sec_filing_count"] and row["normalized_fundamental_field_count"] and not refresh_normalization:
+    mid = build_readiness_report(symbols, effective_as_of, price_years, database_path=database_path)
+    mid_rows = {row["normalized_symbol"]: row for row in mid["rows"]}
+    for _, ticker in requested:
+        row = before_rows.get(ticker, {})
+        if row.get("eligibility_status") == "excluded":
+            continue
+        current = mid_rows.get(ticker, row)
+        if skip_fundamentals:
+            stage_items.append(_stage_item(ticker, "SEC_INGESTION_COMPLETE", "skipped", "fundamentals skipped by caller"))
+            stage_items.append(_stage_item(ticker, "NORMALIZATION_COMPLETE", "skipped", "fundamentals skipped by caller"))
+        elif row["sec_filing_count"] and row["normalized_fundamental_field_count"] and not refresh_normalization:
             stage_items.append(_stage_item(ticker, "SEC_INGESTION_COMPLETE", "skipped", "already has SEC filings"))
             stage_items.append(_stage_item(ticker, "NORMALIZATION_COMPLETE", "skipped", "already normalized"))
         else:
@@ -446,10 +506,31 @@ def prepare_universe_data(
                 stage_items.append(_stage_item(ticker, "SEC_INGESTION_COMPLETE", "failed", type(exc).__name__, 1))
                 failures.append(_failure(ticker, "SEC_INGESTION_COMPLETE", "api_or_no_data", type(exc).__name__, str(exc), 1, True))
                 continue
-        stage_items.append(_stage_item(ticker, "READINESS_VERIFIED", "succeeded", "verified after attempted stages"))
+        stage_items.append(_stage_item(ticker, "READINESS_VERIFIED", "succeeded" if current else "failed", "verified after attempted stages"))
     after = build_readiness_report(symbols, effective_as_of, price_years, database_path=database_path)
     summary = _preparation_summary(started, _now_iso(), before, after, stage_items, failures)
-    payload = {"summary": summary, "before": before["summary"], "after": after["summary"], "stage_items": stage_items, "failures": failures}
+    summary["database_path"] = str(settings.DATABASE_PATH)
+    summary["requested_tickers"] = before["requested_count"]
+    summary["resolved_tickers"] = sum(1 for row in after["rows"] if row["security_resolution_status"] == "resolved")
+    summary["price_update_attempted"] = summary["attempted_count_by_stage"].get("PRICE_UPDATE_COMPLETE", 0)
+    summary["price_update_succeeded"] = summary["succeeded_count_by_stage"].get("PRICE_UPDATE_COMPLETE", 0)
+    summary["stored_price_tickers"] = sum(1 for row in after["rows"] if row["price_row_count"] > 0)
+    summary["stored_price_rows"] = sum(int(row["price_row_count"]) for row in after["rows"])
+    summary["sec_update_attempted"] = summary["attempted_count_by_stage"].get("SEC_INGESTION_COMPLETE", 0)
+    summary["sec_update_succeeded"] = summary["succeeded_count_by_stage"].get("SEC_INGESTION_COMPLETE", 0)
+    summary["normalized_fundamental_tickers"] = sum(1 for row in after["rows"] if row["normalized_fundamental_field_count"] > 0)
+    summary["graham_evaluable_tickers"] = after["summary"]["graham_evaluable"]
+    summary["technical_evaluable_tickers"] = after["summary"]["technical_evaluable"]
+    summary["combined_evaluable_tickers"] = after["summary"]["combined_evaluable"]
+    by_reason: Dict[str, int] = {}
+    for failure in failures:
+        reason = failure["safe_error_message"] or failure["failure_category"]
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    for category, count in after["summary"]["categories"].items():
+        if category != READY:
+            by_reason[category] = by_reason.get(category, 0) + count
+    summary["failures_by_reason"] = dict(sorted(by_reason.items()))
+    payload = {"summary": summary, "before": before["summary"], "after": after["summary"], "rows": after["rows"], "stage_items": stage_items, "failures": failures}
     if export_dir:
         export_preparation_report(payload, export_dir)
     return payload

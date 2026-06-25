@@ -237,7 +237,33 @@ The SQLite database path is configured in `config/settings.py`:
 data/algotrad.db
 ```
 
+Internally this resolves to an absolute path under the project root. Normal operation should use this one SQLite file only. You can inspect the active path with:
+
+```powershell
+python main.py db-status
+```
+
 Database files under `data/*.db` and related SQLite sidecar files are excluded by `.gitignore`.
+
+## Operational Workflow
+
+Daily stored-data screening should follow this order:
+
+```powershell
+$env:SEC_USER_AGENT = "Your Name your.email@example.com"
+python main.py update-universe
+python main.py prepare-universe-data --ticker-file outputs\combined_validation\eligible-universe-100.txt --price-years 6 --fundamental-years 6 --resume
+python main.py db-status
+python main.py data-readiness-report --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2026-06-24 --price-years 6
+python main.py screen-combined --ticker-file outputs\combined_validation\eligible-universe-100.txt --as-of 2026-06-24
+python main.py run-combined-backtest --ticker-file outputs\combined_validation\eligible-universe-100.txt --start-date 2026-06-01 --end-date 2026-06-24 --no-persist
+```
+
+`prepare-universe-data --resume` reads current readiness first, skips complete ticker/stage combinations, updates stale or missing prices, ingests missing SEC fundamentals when `SEC_USER_AGENT` is set, and then reads the same SQLite rows back for verification. Screening and backtesting are stored-data only: they do not call yfinance or SEC.
+
+Use `data-readiness-report` to inspect failures. Zero qualified stocks means the stored inputs ran and failed the current Graham, technical panic, or combined criteria; it is not a data-flow problem when readiness shows explicit categories and persisted rows. Confirm persistence with `db-status` and the readiness fields `stored_price_tickers`, `price_row_count`, `latest_price_date`, `normalized_fundamental_field_count`, and `combined_evaluable`.
+
+Operational boundary: older SQLite-project ideas may be reused for efficient downloads, caching, batching, and database reuse. Old strategy definitions must not replace the current Graham scoring, technical panic criteria, combined scoring, named presets, or backtest behavior.
 
 ## Initialize the database
 

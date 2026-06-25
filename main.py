@@ -3,12 +3,15 @@
 import argparse
 import json
 import logging
+import time
+from datetime import date
 from pathlib import Path
 from typing import List, Optional
 
+from config import settings
 from backtesting.engine import run_backtest
 from backtesting.models import BacktestConfig
-from config.settings import DEFAULT_TEST_TICKERS, LOG_LEVEL
+from config.settings import DATABASE_PATH, DEFAULT_TEST_TICKERS, LOG_LEVEL, resolve_database_path
 from configurations.models import CombinedStrategyConfig, GrahamStrategyConfig, TechnicalCapitulationConfig, UniverseConfig
 from configurations.presets import get_combined_preset, get_preset, list_presets
 from configurations.serialization import config_from_json, config_to_json
@@ -26,6 +29,8 @@ from data.universe import (
     build_universe_from_sec_map,
     coverage_freshness,
     deterministic_sample,
+    export_production_universe,
+    production_universe_summary,
     read_ticker_file,
     run_tracked_batch,
     universe_status as get_universe_status,
@@ -48,6 +53,7 @@ from fundamentals.repository import fundamentals_status
 from fundamentals.service import (
     get_filing_history,
     get_fundamentals_as_of,
+    update_fundamentals_for_ticker,
     update_fundamentals_universe,
 )
 from reporting.backtest_report import create_backtest_report
@@ -55,9 +61,10 @@ from reporting.comparison import compare_backtests
 from reporting.exports import export_backtest_report, export_comparison, export_experiment
 from reporting.graham_report import export_graham_evaluations, graham_audit_row, graham_evaluation_to_dict, graham_summary_row
 from reporting.combined_strategy_report import combined_coverage_summary, combined_summary_row, export_combined_evaluations
+from reporting.daily_opportunities import build_daily_opportunities, export_daily_opportunities
 from reporting.shortlist_report import export_shortlist_report, shortlist_report
 from reporting.validation_report import export_validation_report, validation_report
-from strategies.combined_graham_technical import CombinedGrahamTechnicalStrategy, rank_combined_candidates
+from strategies.combined_graham_technical import CombinedGrahamTechnicalStrategy, evaluate_technical_capitulation, rank_combined_candidates
 from strategies.graham_value import GrahamValueStrategy
 from strategies.moving_average_reversion import MovingAverageReversionStrategy
 from validation.comparison import compare_strategies_fair, validate_across_periods, validate_development_holdout_run
@@ -180,11 +187,34 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_graham.add_argument("--export-dir", default=None)
 
     screen_graham = subparsers.add_parser("screen-graham", help="Screen multiple Graham candidates")
-    screen_graham.add_argument("--tickers", nargs="+", default=DEFAULT_TEST_TICKERS)
+    src = screen_graham.add_mutually_exclusive_group()
+    src.add_argument("--tickers", nargs="+", default=None)
+    src.add_argument("--ticker-file", default=None)
+    src.add_argument("--universe", choices=["all-eligible"], default=None)
+    screen_graham.add_argument("--limit", type=int, default=None)
+    screen_graham.add_argument("--offset", type=int, default=0)
     screen_graham.add_argument("--as-of", required=True)
     _add_graham_threshold_flags(screen_graham)
     screen_graham.add_argument("--json", action="store_true")
     screen_graham.add_argument("--export-dir", default=None)
+
+    screen_technical = subparsers.add_parser("screen-technical", help="Screen technical capitulation candidates")
+    src = screen_technical.add_mutually_exclusive_group()
+    src.add_argument("--tickers", nargs="+", default=None)
+    src.add_argument("--ticker-file", default=None)
+    src.add_argument("--universe", choices=["all-eligible"], default=None)
+    screen_technical.add_argument("--limit", type=int, default=None)
+    screen_technical.add_argument("--offset", type=int, default=0)
+    screen_technical.add_argument("--as-of", required=True)
+    screen_technical.add_argument("--minimum-five-day-decline", type=float, default=None)
+    screen_technical.add_argument("--minimum-ten-day-decline", type=float, default=None)
+    screen_technical.add_argument("--minimum-relative-volume", type=float, default=None)
+    screen_technical.add_argument("--maximum-rsi", type=float, default=None)
+    screen_technical.add_argument("--minimum-panic-score", type=float, default=None)
+    screen_technical.add_argument("--confirmation-window-days", type=int, default=None)
+    screen_technical.add_argument("--qualified-only", action="store_true")
+    screen_technical.add_argument("--json", action="store_true")
+    screen_technical.add_argument("--export-dir", default=None)
 
     audit_graham = subparsers.add_parser("audit-graham-data", help="Audit stored Graham data coverage without downloading")
     audit_graham.add_argument("--tickers", nargs="+", required=True)
@@ -227,6 +257,10 @@ def build_parser() -> argparse.ArgumentParser:
     list_universe.add_argument("--descending", action="store_true")
     list_universe.add_argument("--json", action="store_true")
     list_universe.add_argument("--export-dir", default=None)
+
+    export_eligible = subparsers.add_parser("export-eligible-universe", help="Export the stored eligible production universe")
+    export_eligible.add_argument("--output", required=True)
+    export_eligible.add_argument("--json", action="store_true")
 
     sample_universe = subparsers.add_parser("sample-universe", help="Create a deterministic universe sample")
     sample_universe.add_argument("--eligible-only", action="store_true")
@@ -352,6 +386,22 @@ def build_parser() -> argparse.ArgumentParser:
     combined_backtest.add_argument("--benchmark", default=None)
     combined_backtest.add_argument("--no-persist", action="store_true")
     combined_backtest.add_argument("--export-dir", default=None)
+
+    daily = subparsers.add_parser("run-daily-screen", help="Run the daily stored-data idea-generation workflow")
+    daily.add_argument("--as-of", default=None)
+    daily.add_argument("--ticker-file", default=None)
+    daily.add_argument("--skip-universe-refresh", action="store_true")
+    daily.add_argument("--skip-fundamentals", action="store_true")
+    daily.add_argument("--price-years", type=int, default=6)
+    daily.add_argument("--fundamental-years", type=int, default=6)
+    daily.add_argument("--price-batch-size", type=int, default=100)
+    daily.add_argument("--fundamental-batch-size", type=int, default=25)
+    _add_combined_threshold_flags(daily)
+    daily.add_argument("--max-results", type=int, default=10)
+    daily.add_argument("--resume", action="store_true")
+    daily.add_argument("--refresh-normalization", action="store_true")
+    daily.add_argument("--export-dir", default=None)
+    daily.add_argument("--json", action="store_true")
 
     compare_strategies = subparsers.add_parser("compare-strategies", help="Compare Graham, technical, and combined strategies")
     src = compare_strategies.add_mutually_exclusive_group()
@@ -480,6 +530,7 @@ def _show_prices(ticker: str, start_date: Optional[str], end_date: Optional[str]
 
 def _print_db_status() -> None:
     status = get_database_status()
+    print(f"Database path: {resolve_database_path(DATABASE_PATH)}")
     print(f"Securities: {status['securities']}")
     print(f"Daily price rows: {status['daily_price_rows']}")
     print(f"Earliest stored date: {status['earliest_date']}")
@@ -784,6 +835,21 @@ def _list_universe_command(args: argparse.Namespace) -> None:
         print(f"Exported {write_json(Path(args.export_dir) / 'security-universe.json', rows)}")
 
 
+def _export_eligible_universe_command(args: argparse.Namespace) -> None:
+    payload = export_production_universe(args.output)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+    print(f"Database path: {resolve_database_path(DATABASE_PATH)}")
+    print(f"raw_universe_rows={payload['raw_universe_rows']}")
+    print(f"normalized_unique_symbols={payload['normalized_unique_symbols']}")
+    print(f"eligible_securities={payload['eligible_securities']}")
+    print(f"exported_tickers={payload['exported_tickers']}")
+    print(f"malformed_securities={payload['malformed_securities']}")
+    print(f"excluded_by_reason={payload['excluded_by_reason']}")
+    print(f"output={payload['output']}")
+
+
 def _sample_universe_command(args: argparse.Namespace) -> None:
     tickers = universe_tickers(args.eligible_only)
     sample = deterministic_sample(tickers, args.count, args.seed)
@@ -803,20 +869,46 @@ def _sample_universe_command(args: argparse.Namespace) -> None:
 
 def _update_universe_prices_command(args: argparse.Namespace) -> None:
     tickers = _source_tickers(args)
-    result = run_tracked_batch("prices", tickers, lambda ticker: update_ticker_prices(ticker, start_date=args.start_date, end_date=args.end_date), dry_run=args.dry_run, max_retries=args.max_retries, resume_run=args.resume_run)
+    database_path = str(resolve_database_path(DATABASE_PATH))
+    if not args.json:
+        print(f"Database path: {database_path}")
+    if args.dry_run:
+        result = run_tracked_batch("prices", tickers, lambda ticker: {"status": "skipped", "skipped_count": 1}, dry_run=True, max_retries=args.max_retries, resume_run=args.resume_run)
+    else:
+        result = update_price_universe(tickers, start_date=args.start_date, end_date=args.end_date, batch_size=args.batch_size)
     if args.json:
+        result["database_path"] = database_path
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
     else:
-        print(f"requested={result['requested_count']} succeeded={result['succeeded_count']} failed={result['failed_count']} skipped={result['skipped_count']} run_id={result['run_id']}")
+        if "requested_count" in result:
+            print(f"requested={result['requested_count']} succeeded={result['succeeded_count']} failed={result['failed_count']} skipped={result['skipped_count']} run_id={result['run_id']}")
+        else:
+            print(f"requested={result['tickers_requested']} updated={result['updated']} already_current={result['already_current']} no_data={result['no_data']} failed={result['failed']} rows_stored={result['rows_stored']}")
 
 
 def _update_universe_fundamentals_command(args: argparse.Namespace) -> None:
     tickers = _source_tickers(args)
+    database_path = str(resolve_database_path(DATABASE_PATH))
+    if not args.json:
+        print(f"Database path: {database_path}")
     if args.dry_run:
         result = run_tracked_batch("fundamentals", tickers, lambda ticker: {"status": "skipped", "skipped_count": 1}, dry_run=True, max_retries=args.max_retries, resume_run=args.resume_run)
-    else:
+    elif not settings.SEC_USER_AGENT:
         result = {"requested_count": len(tickers), "status": "blocked", "error": "SEC_USER_AGENT is required for SEC fundamentals ingestion"}
-    print(json.dumps(result, indent=2, sort_keys=True, default=str) if args.json else result)
+    else:
+        result = run_tracked_batch(
+            "fundamentals",
+            tickers,
+            lambda ticker: update_fundamentals_for_ticker(ticker, years=args.years),
+            dry_run=False,
+            max_retries=args.max_retries,
+            resume_run=args.resume_run,
+        )
+    if args.json:
+        result["database_path"] = database_path
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        print(result)
 
 
 def _refresh_fundamentals_normalization_command(args: argparse.Namespace) -> None:
@@ -838,6 +930,7 @@ def _data_readiness_report_command(args: argparse.Namespace) -> None:
     payload = build_readiness_report(symbols, args.as_of, price_years=args.price_years)
     audit = database_audit_for_tickers(symbols, args.as_of, price_years=args.price_years)
     payload["database_audit"] = audit
+    payload["database_path"] = str(resolve_database_path(DATABASE_PATH))
     if args.export_dir:
         paths = export_readiness_report(payload, args.export_dir)
         print(f"Exported {paths['json']}")
@@ -847,6 +940,7 @@ def _data_readiness_report_command(args: argparse.Namespace) -> None:
         return
     summary = payload["summary"]
     reconciliation = payload["reconciliation"]
+    print(f"Database path: {payload['database_path']}")
     print(f"requested={payload['requested_count']} unique={payload['unique_normalized_count']} ready={summary['ready']}")
     print(f"price_ready={summary['price_ready']} graham_evaluable={summary['graham_evaluable']} technical_evaluable={summary['technical_evaluable']} combined_evaluable={summary['combined_evaluable']}")
     print(f"categories={summary['categories']}")
@@ -855,6 +949,8 @@ def _data_readiness_report_command(args: argparse.Namespace) -> None:
 
 def _prepare_universe_data_command(args: argparse.Namespace) -> None:
     symbols = read_input_symbols(args.ticker_file)
+    if not args.json:
+        print(f"Database path: {resolve_database_path(DATABASE_PATH)}")
     payload = prepare_universe_data(
         symbols,
         price_years=args.price_years,
@@ -863,6 +959,8 @@ def _prepare_universe_data_command(args: argparse.Namespace) -> None:
         refresh_normalization=args.refresh_normalization,
         resume=args.resume,
         export_dir=None,
+        price_batch_size=args.price_batch_size,
+        fundamental_batch_size=args.fundamental_batch_size,
     )
     if args.export_dir:
         paths = export_preparation_report(payload, args.export_dir)
@@ -873,7 +971,10 @@ def _prepare_universe_data_command(args: argparse.Namespace) -> None:
         return
     summary = payload["summary"]
     print(f"run_identifier={summary['run_identifier']}")
-    print(f"requested={summary['requested_ticker_count']} already_complete={summary['already_complete_count']} final_ready={summary['final_ready_count']} remaining_not_ready={summary['remaining_not_ready_count']}")
+    print(f"requested={summary['requested_ticker_count']} resolved={summary.get('resolved_tickers')} already_complete={summary['already_complete_count']} final_ready={summary['final_ready_count']} remaining_not_ready={summary['remaining_not_ready_count']}")
+    print(f"stored_price_tickers={summary.get('stored_price_tickers')} stored_price_rows={summary.get('stored_price_rows')}")
+    print(f"normalized_fundamental_tickers={summary.get('normalized_fundamental_tickers')} graham_evaluable={summary.get('graham_evaluable_tickers')} technical_evaluable={summary.get('technical_evaluable_tickers')} combined_evaluable={summary.get('combined_evaluable_tickers')}")
+    print(f"failures_by_reason={summary.get('failures_by_reason')}")
     print(f"attempted_by_stage={summary['attempted_count_by_stage']}")
     print(f"failed_by_stage={summary['failed_count_by_stage']}")
 
@@ -909,8 +1010,11 @@ def _evaluate_graham_command(args: argparse.Namespace) -> None:
 
 
 def _screen_graham_command(args: argparse.Namespace) -> None:
+    database_path = str(resolve_database_path(DATABASE_PATH))
+    if not args.json:
+        print(f"Database path: {database_path}")
     strategy = _graham_strategy(args)
-    evaluations = [strategy.evaluate(ticker, args.as_of) for ticker in args.tickers]
+    evaluations = [strategy.evaluate(ticker, args.as_of) for ticker in _source_tickers(args)]
     rows = [graham_summary_row(evaluation) for evaluation in evaluations]
     if args.json:
         print(json.dumps(rows, indent=2, sort_keys=True, default=str))
@@ -925,6 +1029,50 @@ def _screen_graham_command(args: argparse.Namespace) -> None:
     if args.export_dir:
         for path in export_graham_evaluations(evaluations, args.export_dir):
             print(f"Exported {path}")
+
+
+def _screen_technical_command(args: argparse.Namespace) -> None:
+    database_path = str(resolve_database_path(DATABASE_PATH))
+    if not args.json:
+        print(f"Database path: {database_path}")
+    base = TechnicalCapitulationConfig()
+    config = TechnicalCapitulationConfig(
+        args.minimum_five_day_decline if args.minimum_five_day_decline is not None else base.minimum_five_day_decline,
+        args.minimum_ten_day_decline if args.minimum_ten_day_decline is not None else base.minimum_ten_day_decline,
+        args.minimum_relative_volume if args.minimum_relative_volume is not None else base.minimum_relative_volume,
+        args.maximum_rsi if args.maximum_rsi is not None else base.maximum_rsi,
+        args.minimum_panic_score if args.minimum_panic_score is not None else base.minimum_panic_score,
+        base.require_volume_spike,
+        base.require_oversold,
+        base.moving_average_window,
+        base.minimum_distance_below_moving_average,
+        base.rsi_window,
+        base.volume_lookback,
+        args.confirmation_window_days if args.confirmation_window_days is not None else base.confirmation_window_days,
+    )
+    rows = []
+    for ticker in _source_tickers(args):
+        history = repository_strategy_data.get_ticker_history(ticker, end_date=args.as_of)
+        evaluation = evaluate_technical_capitulation(ticker, args.as_of, history, config)
+        rows.append(
+            {
+                "ticker": ticker,
+                "technical_evaluable": len(history) >= 21,
+                "technical_qualified": evaluation.qualified,
+                "panic_score": evaluation.panic_score.total_score,
+                "relative_volume": evaluation.metrics.relative_volume,
+                "rsi": evaluation.metrics.rsi,
+                "failure_reason": evaluation.disqualification_reasons[0] if evaluation.disqualification_reasons else "",
+                "warnings": "; ".join(evaluation.warnings),
+            }
+        )
+    if args.qualified_only:
+        rows = [row for row in rows if row["technical_qualified"]]
+    if args.json:
+        print(json.dumps({"database_path": database_path, "rows": rows}, indent=2, sort_keys=True, default=str))
+    else:
+        for row in rows:
+            print(f"{row['ticker']} evaluable={row['technical_evaluable']} technical={row['technical_qualified']} panic_score={row['panic_score']} reason={row['failure_reason'] or '(none)'} warnings={row['warnings'] or '(none)'}")
 
 
 def _audit_graham_data_command(args: argparse.Namespace) -> None:
@@ -984,13 +1132,8 @@ def _run_graham_backtest_command(args: argparse.Namespace) -> None:
     _print_backtest_result(result)
 
 
-def _screen_combined_command(args: argparse.Namespace) -> None:
-    try:
-        tickers = _source_tickers(args)
-        strategy = _combined_strategy(args)
-    except (ValueError, ConfigurationValidationError) as exc:
-        print(f"Combined screen failed: {exc}")
-        return
+def _combined_screen_payload(args: argparse.Namespace, tickers: List[str]) -> dict:
+    strategy = _combined_strategy(args)
     evaluations = []
     for ticker in tickers:
         history = repository_strategy_data.get_ticker_history(ticker, end_date=args.as_of)
@@ -1000,12 +1143,38 @@ def _screen_combined_command(args: argparse.Namespace) -> None:
             print(f"{ticker}: combined evaluation failed: {exc}")
     evaluations = rank_combined_candidates(evaluations)
     rows = [combined_summary_row(item) for item in evaluations]
-    if args.qualified_only:
+    if getattr(args, "qualified_only", False):
         rows = [row for row in rows if row["combined_qualified"]]
-    if args.sort_by and rows and args.sort_by in rows[0]:
-        rows = sorted(rows, key=lambda row: (row.get(args.sort_by) is None, row.get(args.sort_by), row["ticker"]), reverse=args.descending)
+    sort_by = getattr(args, "sort_by", "combined_score")
+    descending = getattr(args, "descending", True)
+    if sort_by and rows and sort_by in rows[0]:
+        rows = sorted(rows, key=lambda row: (row.get(sort_by) is None, row.get(sort_by), row["ticker"]), reverse=descending)
     summary = combined_coverage_summary(rows)
-    payload = {"rows": rows, "coverage_summary": summary}
+    readiness = build_readiness_report(tickers, args.as_of, price_years=6)
+    summary.update(
+        {
+            "price_ready_tickers": readiness["summary"]["price_ready"],
+            "fundamental_ready_tickers": readiness["summary"]["graham_evaluable"],
+            "graham_evaluable_tickers": readiness["summary"]["graham_evaluable"],
+            "technical_evaluable_tickers": readiness["summary"]["technical_evaluable"],
+            "combined_evaluable_tickers": readiness["summary"]["combined_evaluable"],
+            "missing_data_tickers": len(tickers) - readiness["summary"]["combined_evaluable"],
+        }
+    )
+    return {"rows": rows, "coverage_summary": summary, "readiness": readiness}
+
+
+def _screen_combined_command(args: argparse.Namespace) -> None:
+    database_path = str(resolve_database_path(DATABASE_PATH))
+    if not args.json:
+        print(f"Database path: {database_path}")
+    try:
+        tickers = _source_tickers(args)
+        payload = _combined_screen_payload(args, tickers)
+    except (ValueError, ConfigurationValidationError) as exc:
+        print(f"Combined screen failed: {exc}")
+        return
+    payload = {"database_path": database_path, "rows": payload["rows"], "coverage_summary": payload["coverage_summary"]}
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     else:
@@ -1018,6 +1187,7 @@ def _screen_combined_command(args: argparse.Namespace) -> None:
 
 
 def _run_combined_backtest_command(args: argparse.Namespace) -> None:
+    print(f"Database path: {resolve_database_path(DATABASE_PATH)}")
     try:
         tickers = _source_tickers(args)
         strategy = _combined_strategy(args)
@@ -1032,6 +1202,88 @@ def _run_combined_backtest_command(args: argparse.Namespace) -> None:
         print("Run update-prices and update-fundamentals first; this command does not download missing data.")
         return
     _print_backtest_result(result)
+
+
+def _run_daily_screen_command(args: argparse.Namespace) -> None:
+    database_path = str(resolve_database_path(DATABASE_PATH))
+    as_of = args.as_of or date.today().isoformat()
+    export_dir = args.export_dir or "outputs/daily"
+    timings = {}
+    started = time.perf_counter()
+    if not args.skip_universe_refresh:
+        t0 = time.perf_counter()
+        initialize_database()
+        universe_result = build_universe_from_sec_map()
+        timings["universe_refresh_seconds"] = round(time.perf_counter() - t0, 3)
+    else:
+        universe_result = None
+        timings["universe_refresh_seconds"] = 0.0
+
+    if args.ticker_file:
+        tickers = read_ticker_file(args.ticker_file)
+        ticker_source = args.ticker_file
+    else:
+        tickers = universe_tickers(True)
+        ticker_source = "stored eligible universe"
+
+    t0 = time.perf_counter()
+    preparation = prepare_universe_data(
+        tickers,
+        price_years=args.price_years,
+        fundamental_years=args.fundamental_years,
+        as_of=as_of,
+        refresh_normalization=args.refresh_normalization,
+        resume=args.resume,
+        price_batch_size=args.price_batch_size,
+        fundamental_batch_size=args.fundamental_batch_size,
+        skip_fundamentals=args.skip_fundamentals,
+        fundamental_worker=update_fundamentals_for_ticker,
+    )
+    timings["preparation_seconds"] = round(time.perf_counter() - t0, 3)
+
+    t0 = time.perf_counter()
+    screen_payload = _combined_screen_payload(args, tickers)
+    timings["stored_data_screening_seconds"] = round(time.perf_counter() - t0, 3)
+
+    t0 = time.perf_counter()
+    metadata_rows = list_security_universe()
+    metadata = {row["normalized_ticker"]: row for row in metadata_rows}
+    readiness_rows = {row["normalized_symbol"]: row for row in screen_payload["readiness"]["rows"]}
+    report = build_daily_opportunities(
+        screen_payload["rows"],
+        metadata,
+        readiness_rows,
+        as_of=as_of,
+        max_results=args.max_results,
+    )
+    paths = export_daily_opportunities(report, export_dir)
+    timings["report_generation_seconds"] = round(time.perf_counter() - t0, 3)
+    timings["total_seconds"] = round(time.perf_counter() - started, 3)
+
+    summary = {
+        "database_path": database_path,
+        "as_of": as_of,
+        "ticker_source": ticker_source,
+        "requested": len(tickers),
+        "universe": production_universe_summary(),
+        "universe_refresh": universe_result.__dict__ if universe_result else {"skipped": True},
+        "preparation": preparation["summary"],
+        "screening": screen_payload["coverage_summary"],
+        "daily_report": paths,
+        "section_counts": {name: len(rows) for name, rows in report["sections"].items()},
+        "timings": timings,
+    }
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True, default=str))
+        return
+    print(f"Database path: {database_path}")
+    print(f"as_of={as_of} requested={summary['requested']}")
+    print(f"price_ready={summary['screening']['price_ready_tickers']} graham_evaluable={summary['screening']['graham_evaluable_tickers']} technical_evaluable={summary['screening']['technical_evaluable_tickers']} combined_evaluable={summary['screening']['combined_evaluable_tickers']}")
+    print(f"graham_qualified={summary['screening']['graham_qualified_tickers']} technical_qualified={summary['screening']['technical_qualified_tickers']} combined_qualified={summary['screening']['combined_qualified_tickers']}")
+    print(f"failures_by_reason={summary['preparation'].get('failures_by_reason')}")
+    print(f"daily_report_csv={paths['csv']}")
+    print(f"daily_report_json={paths['json']}")
+    print(f"timings={timings}")
 
 
 def _compare_strategies_command(args: argparse.Namespace) -> None:
@@ -1263,6 +1515,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         _evaluate_graham_command(args)
     elif args.command == "screen-graham":
         _screen_graham_command(args)
+    elif args.command == "screen-technical":
+        _screen_technical_command(args)
     elif args.command == "audit-graham-data":
         _audit_graham_data_command(args)
     elif args.command == "run-graham-backtest":
@@ -1273,6 +1527,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         _universe_status_command()
     elif args.command == "list-universe":
         _list_universe_command(args)
+    elif args.command == "export-eligible-universe":
+        _export_eligible_universe_command(args)
     elif args.command == "sample-universe":
         _sample_universe_command(args)
     elif args.command == "update-universe-prices":
@@ -1291,6 +1547,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         _screen_combined_command(args)
     elif args.command == "run-combined-backtest":
         _run_combined_backtest_command(args)
+    elif args.command == "run-daily-screen":
+        _run_daily_screen_command(args)
     elif args.command == "compare-strategies":
         _compare_strategies_command(args)
     elif args.command == "validate-strategy":

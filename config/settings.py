@@ -2,10 +2,21 @@
 
 import os
 from pathlib import Path
+from typing import Optional, Union
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STORAGE_DIR = PROJECT_ROOT / "data"
-DATABASE_PATH = STORAGE_DIR / "algotrad.db"
+
+
+def resolve_database_path(value: Optional[Union[str, Path]] = None) -> Path:
+    """Return the single authoritative SQLite path as an absolute path."""
+    configured = Path(value or os.getenv("ALGOTRAD_DATABASE_PATH") or (STORAGE_DIR / "algotrad.db"))
+    if not configured.is_absolute():
+        configured = PROJECT_ROOT / configured
+    return configured.expanduser().resolve()
+
+
+DATABASE_PATH = resolve_database_path()
 
 DEFAULT_TEST_TICKERS = ["AAPL", "MSFT", "KO", "F", "INTC"]
 DEFAULT_PRICE_HISTORY_START_DATE = "2024-01-01"

@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional, Union
 
-from config.settings import DATABASE_PATH
+from config.settings import DATABASE_PATH, resolve_database_path
 
 logger = logging.getLogger(__name__)
 DatabasePath = Union[str, Path]
@@ -15,10 +15,13 @@ DatabasePath = Union[str, Path]
 @contextmanager
 def get_connection(database_path: Optional[DatabasePath] = None) -> Iterator[sqlite3.Connection]:
     """Yield a SQLite connection with foreign key enforcement enabled."""
-    path = Path(database_path) if database_path is not None else DATABASE_PATH
+    path = resolve_database_path(database_path) if database_path is not None else Path(DATABASE_PATH).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    connection = sqlite3.connect(str(path))
+    try:
+        connection = sqlite3.connect(str(path))
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Could not open SQLite database at {path}: {exc}") from exc
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA foreign_keys = ON")

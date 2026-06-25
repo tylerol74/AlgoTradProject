@@ -55,6 +55,7 @@ def combined_coverage_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "fundamental_ready_tickers": sum(1 for row in rows if row["data_ready"]),
         "graham_evaluable_tickers": total,
         "technical_evaluable_tickers": sum(1 for row in rows if row["five_day_return"] is not None),
+        "combined_evaluable_tickers": sum(1 for row in rows if row["data_ready"] and row["five_day_return"] is not None),
         "graham_qualified_tickers": sum(1 for row in rows if row["graham_qualified"]),
         "technical_qualified_tickers": sum(1 for row in rows if row["technical_qualified"]),
         "combined_qualified_tickers": sum(1 for row in rows if row["combined_qualified"]),
