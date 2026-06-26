@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import settings
 from data.sec_client import SECClient
-from data.sec_ticker_map import CIKMappingError, get_cik_for_ticker, normalize_ticker
-from database.repositories import upsert_security
+from data.sec_ticker_map import CIKMappingError, get_cik_for_ticker, normalize_cik, normalize_ticker
+from database.repositories import upsert_provider_refresh_success, upsert_security
 from fundamentals.concepts import EXPECTED_UNITS, SUPPORTED_FORMS, concept_precedence, standardized_field_for_concept
 from fundamentals.normalization import (
     classify_period,
@@ -144,15 +144,36 @@ def update_fundamentals_for_ticker(ticker: str, years: Optional[int] = None, cli
         "facts_seen": 0,
         "facts_stored": 0,
         "unsupported_facts": 0,
+        "provider_success_record_written": False,
+        "provider_key": None,
+        "http_status": None,
         "warnings": [],
         "error": None,
     }
     try:
         sec_client = client or SECClient()
         cik = get_cik_for_ticker(normalized, database_path=database_path, client=sec_client)
+        cik = normalize_cik(cik)
         summary["cik"] = cik
+        summary["provider_key"] = cik
         submissions = sec_client.get_submissions(cik)
         company_facts = sec_client.get_company_facts(cik)
+        downloaded_at = _utc_now_iso()
+        upsert_provider_refresh_success(
+            "sec",
+            "cik",
+            cik,
+            http_status=200,
+            ticker=normalized,
+            metadata={
+                "submissions_returned": bool(submissions),
+                "companyfacts_returned": bool(company_facts),
+            },
+            retrieved_at=downloaded_at,
+            database_path=database_path,
+        )
+        summary["provider_success_record_written"] = True
+        summary["http_status"] = 200
         if not submissions:
             summary["status"] = "no_supported_filings"
             summary["warnings"].append("empty submissions response")
@@ -166,7 +187,6 @@ def update_fundamentals_for_ticker(ticker: str, years: Optional[int] = None, cli
             summary["status"] = "no_supported_filings"
             return summary
         upsert_security(normalized, company_name=submissions.get("name"), security_type="Common Stock", database_path=database_path)
-        downloaded_at = _utc_now_iso()
         filing_ids = {}
         filings_by_accession = {}
         for filing in filings:

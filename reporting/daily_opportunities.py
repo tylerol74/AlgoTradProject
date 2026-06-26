@@ -45,6 +45,11 @@ def build_daily_opportunities(
                 "security_type": meta.get("security_type"),
                 "latest_stored_price": row.get("price"),
                 "price_date": ready.get("latest_price_date"),
+                "data_ready": row.get("data_ready"),
+                "technical_evaluable": row.get("five_day_return") is not None,
+                "graham_evaluable": bool(ready.get("graham_evaluable")),
+                "readiness_technical_evaluable": bool(ready.get("technical_evaluable")),
+                "combined_evaluable": bool(ready.get("combined_evaluable")),
                 "data_freshness_status": ready.get("final_readiness_category") or ("READY" if row.get("data_ready") else "NOT_READY"),
                 "graham_score": row.get("graham_score"),
                 "graham_qualified": row.get("graham_qualified"),
@@ -62,16 +67,40 @@ def build_daily_opportunities(
                 "margin_of_safety": row.get("margin_of_safety"),
             }
         )
-    combined = [row for row in enriched if row.get("combined_qualified") or row.get("combined_score") is not None]
-    graham = [row for row in enriched if row.get("graham_score") is not None and not row.get("combined_qualified")]
-    technical = [row for row in enriched if row.get("technical_score") is not None and not row.get("combined_qualified")]
+    combined_candidates = [row for row in enriched if row.get("combined_qualified")]
+    combined_watchlist = [
+        row
+        for row in enriched
+        if row.get("combined_evaluable") and not row.get("combined_qualified") and row.get("combined_score") is not None
+    ]
+    graham_rows = [
+        row for row in enriched if row.get("graham_evaluable") and row.get("graham_score") is not None and not row.get("combined_qualified")
+    ]
+    technical_rows = [
+        row
+        for row in enriched
+        if row.get("readiness_technical_evaluable") and row.get("technical_score") is not None and not row.get("combined_qualified")
+    ]
+    sections = {
+        "COMBINED CANDIDATES": _ranked(combined_candidates, "combined_score", max_results),
+        "COMBINED WATCHLIST": _ranked(combined_watchlist, "combined_score", max_results),
+        "GRAHAM WATCHLIST": _ranked(graham_rows, "graham_score", max_results),
+        "TECHNICAL WATCHLIST": _ranked(technical_rows, "technical_score", max_results),
+    }
     return {
         "as_of": as_of,
-        "sections": {
-            "COMBINED CANDIDATES": _ranked(combined, "combined_score", max_results),
-            "GRAHAM WATCHLIST": _ranked(graham, "graham_score", max_results),
-            "TECHNICAL WATCHLIST": _ranked(technical, "technical_score", max_results),
+        "summary": {
+            "combined_qualified_count": len(combined_candidates),
+            "combined_watchlist_count": len(combined_watchlist),
+            "combined_rows_displayed": len(sections["COMBINED CANDIDATES"]) + len(sections["COMBINED WATCHLIST"]),
+            "graham_qualified_count": sum(1 for row in graham_rows if row.get("graham_qualified")),
+            "graham_watchlist_count": sum(1 for row in graham_rows if not row.get("graham_qualified")),
+            "graham_rows_displayed": len(sections["GRAHAM WATCHLIST"]),
+            "technical_qualified_count": sum(1 for row in technical_rows if row.get("technical_qualified")),
+            "technical_watchlist_count": sum(1 for row in technical_rows if not row.get("technical_qualified")),
+            "technical_rows_displayed": len(sections["TECHNICAL WATCHLIST"]),
         },
+        "sections": sections,
     }
 
 
@@ -91,6 +120,11 @@ def export_daily_opportunities(payload: Dict[str, Any], export_dir: str) -> Dict
         "security_type",
         "latest_stored_price",
         "price_date",
+        "data_ready",
+        "technical_evaluable",
+        "graham_evaluable",
+        "readiness_technical_evaluable",
+        "combined_evaluable",
         "data_freshness_status",
         "graham_score",
         "graham_qualified",

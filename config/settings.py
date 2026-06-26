@@ -26,6 +26,7 @@ LOG_LEVEL = "INFO"
 
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "").strip()
 SEC_REQUEST_DELAY_SECONDS = float(os.getenv("SEC_REQUEST_DELAY_SECONDS", "0.2"))
+SEC_PROVIDER_REFRESH_INTERVAL_HOURS = int(os.getenv("SEC_PROVIDER_REFRESH_INTERVAL_HOURS", "24"))
 SEC_BASE_URL = os.getenv("SEC_BASE_URL", "https://www.sec.gov").rstrip("/")
 SEC_COMPANY_FACTS_URL = os.getenv(
     "SEC_COMPANY_FACTS_URL",

@@ -6,7 +6,7 @@ and write through a consistent database boundary.
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -18,6 +18,19 @@ DatabasePath = Union[str, Path]
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _parse_provider_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    text = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def upsert_security(
@@ -244,6 +257,198 @@ def get_sec_ticker_map_rows(database_path: Optional[DatabasePath] = None) -> Lis
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_ciks_for_tickers(tickers: Sequence[str], database_path: Optional[DatabasePath] = None) -> Dict[str, Optional[str]]:
+    """Return best-known CIK values for normalized tickers."""
+    normalized = [ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()]
+    if not normalized:
+        return {}
+    placeholders = ", ".join("?" for _ in normalized)
+    result = {ticker: None for ticker in normalized}
+    with get_connection(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT normalized_ticker AS ticker, cik
+            FROM security_universe
+            WHERE normalized_ticker IN ({placeholders})
+            """,
+            normalized,
+        ).fetchall()
+        for row in rows:
+            if row["cik"]:
+                result[row["ticker"]] = str(row["cik"]).zfill(10)
+        missing = [ticker for ticker, cik in result.items() if not cik]
+        if missing:
+            missing_placeholders = ", ".join("?" for _ in missing)
+            map_rows = connection.execute(
+                f"""
+                SELECT ticker, cik
+                FROM sec_ticker_map
+                WHERE ticker IN ({missing_placeholders})
+                """,
+                missing,
+            ).fetchall()
+            for row in map_rows:
+                if row["cik"]:
+                    result[row["ticker"]] = str(row["cik"]).zfill(10)
+    return result
+
+
+def get_provider_cooldown(
+    provider: str,
+    key_type: str,
+    key_value: str,
+    as_of: str,
+    database_path: Optional[DatabasePath] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return an active provider cooldown for a key, if one exists."""
+    with get_connection(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM provider_failure_cooldowns
+            WHERE provider = ?
+              AND key_type = ?
+              AND key_value = ?
+              AND (cooldown_until IS NULL OR cooldown_until >= ?)
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            """,
+            (provider, key_type, key_value, as_of),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_provider_cooldown(
+    provider: str,
+    key_type: str,
+    key_value: str,
+    failure_type: str,
+    retry_classification: str,
+    error_message: str,
+    cooldown_until: Optional[str],
+    ticker: Optional[str] = None,
+    database_path: Optional[DatabasePath] = None,
+) -> None:
+    """Record or refresh provider failure cooldown state."""
+    now = _utc_now_iso()
+    with get_connection(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO provider_failure_cooldowns (
+                provider, key_type, key_value, ticker, failure_type, retry_classification,
+                error_message, first_seen_at, last_seen_at, cooldown_until, occurrence_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(provider, key_type, key_value, failure_type) DO UPDATE SET
+                ticker = COALESCE(excluded.ticker, provider_failure_cooldowns.ticker),
+                retry_classification = excluded.retry_classification,
+                error_message = excluded.error_message,
+                last_seen_at = excluded.last_seen_at,
+                cooldown_until = excluded.cooldown_until,
+                occurrence_count = provider_failure_cooldowns.occurrence_count + 1
+            """,
+            (
+                provider,
+                key_type,
+                key_value,
+                ticker,
+                failure_type,
+                retry_classification,
+                (error_message or "")[:300],
+                now,
+                now,
+                cooldown_until,
+            ),
+        )
+
+
+def upsert_provider_refresh_success(
+    provider: str,
+    key_type: str,
+    key_value: str,
+    http_status: int = 200,
+    ticker: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    retrieved_at: Optional[str] = None,
+    database_path: Optional[DatabasePath] = None,
+) -> None:
+    """Persist a successful provider retrieval keyed by issuer/provider identity."""
+    now = retrieved_at or _utc_now_iso()
+    with get_connection(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO provider_refresh_status (
+                provider, key_type, key_value, status, http_status, last_success_at,
+                last_retrieved_at, response_retrieved_at, ticker, metadata_json
+            ) VALUES (?, ?, ?, 'success', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, key_type, key_value) DO UPDATE SET
+                status = 'success',
+                http_status = excluded.http_status,
+                last_success_at = excluded.last_success_at,
+                last_retrieved_at = excluded.last_retrieved_at,
+                response_retrieved_at = excluded.response_retrieved_at,
+                ticker = COALESCE(excluded.ticker, provider_refresh_status.ticker),
+                metadata_json = excluded.metadata_json
+            """,
+            (
+                provider,
+                key_type,
+                key_value,
+                int(http_status),
+                now,
+                now,
+                now,
+                ticker,
+                json.dumps(metadata or {}, sort_keys=True),
+            ),
+        )
+
+
+def get_provider_refresh_status(
+    provider: str,
+    key_type: str,
+    key_value: str,
+    database_path: Optional[DatabasePath] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return provider refresh status for a canonical key."""
+    with get_connection(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM provider_refresh_status
+            WHERE provider = ? AND key_type = ? AND key_value = ?
+            """,
+            (provider, key_type, key_value),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def provider_refresh_is_fresh(
+    status: Optional[Dict[str, Any]],
+    interval_hours: int,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Return freshness decision details for a provider refresh status row."""
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    last_success = _parse_provider_timestamp((status or {}).get("last_success_at"))
+    cutoff = current - timedelta(hours=max(0, int(interval_hours)))
+    fresh = bool(status and status.get("status") == "success" and last_success and last_success >= cutoff)
+    stale_reason = ""
+    if not status:
+        stale_reason = "missing provider success status"
+    elif status.get("status") != "success":
+        stale_reason = f"provider status is {status.get('status')}"
+    elif last_success is None:
+        stale_reason = "missing or invalid last_success_at"
+    elif last_success < cutoff:
+        stale_reason = "provider success status is stale"
+    return {
+        "fresh": fresh,
+        "last_success_at": last_success.isoformat() if last_success else None,
+        "freshness_cutoff": cutoff.isoformat(),
+        "stale_reason": stale_reason,
+    }
 
 
 def upsert_security_universe(rows: Sequence[Dict[str, Any]], database_path: Optional[DatabasePath] = None) -> int:

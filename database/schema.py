@@ -226,6 +226,37 @@ _SCHEMA_STATEMENTS = (
         FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS provider_failure_cooldowns (
+        provider TEXT NOT NULL,
+        key_type TEXT NOT NULL,
+        key_value TEXT NOT NULL,
+        ticker TEXT,
+        failure_type TEXT NOT NULL,
+        retry_classification TEXT NOT NULL,
+        error_message TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        cooldown_until TEXT,
+        occurrence_count INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (provider, key_type, key_value, failure_type)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS provider_refresh_status (
+        provider TEXT NOT NULL,
+        key_type TEXT NOT NULL,
+        key_value TEXT NOT NULL,
+        status TEXT NOT NULL,
+        http_status INTEGER,
+        last_success_at TEXT,
+        last_retrieved_at TEXT NOT NULL,
+        response_retrieved_at TEXT NOT NULL,
+        ticker TEXT,
+        metadata_json TEXT,
+        PRIMARY KEY (provider, key_type, key_value)
+    )
+    """,
 )
 
 _INDEX_STATEMENTS = (
@@ -263,6 +294,10 @@ _INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_ingestion_runs_type ON ingestion_runs(run_type, status)",
     "CREATE INDEX IF NOT EXISTS idx_ingestion_run_items_run ON ingestion_run_items(run_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_ingestion_run_items_ticker ON ingestion_run_items(ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_provider_failure_cooldowns_key ON provider_failure_cooldowns(provider, key_type, key_value)",
+    "CREATE INDEX IF NOT EXISTS idx_provider_failure_cooldowns_until ON provider_failure_cooldowns(cooldown_until)",
+    "CREATE INDEX IF NOT EXISTS idx_provider_refresh_status_key ON provider_refresh_status(provider, key_type, key_value)",
+    "CREATE INDEX IF NOT EXISTS idx_provider_refresh_status_success ON provider_refresh_status(provider, last_success_at)",
 )
 
 
