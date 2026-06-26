@@ -3,10 +3,12 @@
 import argparse
 import json
 import logging
+import shutil
+import sqlite3
 import time
 from datetime import date
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from config import settings
 from backtesting.engine import run_backtest
@@ -47,6 +49,7 @@ from database.repositories import (
     list_security_universe,
 )
 from database.schema import initialize_database
+from database.connection import get_connection
 from experiments.models import experiment_config_from_dict
 from experiments.runner import experiment_summary, run_experiment
 from fundamentals.repository import fundamentals_status
@@ -390,8 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
     daily = subparsers.add_parser("run-daily-screen", help="Run the daily stored-data idea-generation workflow")
     daily.add_argument("--as-of", default=None)
     daily.add_argument("--ticker-file", default=None)
-    daily.add_argument("--skip-universe-refresh", action="store_true")
+    daily.add_argument("--refresh-universe", action="store_true")
+    daily.add_argument("--skip-universe-refresh", action="store_true", help="Deprecated; universe refresh is skipped by default for daily screening")
     daily.add_argument("--skip-fundamentals", action="store_true")
+    daily.add_argument("--force-provider-refresh", action="store_true")
+    daily.add_argument("--minimum-free-space-mb", type=int, default=1024)
     daily.add_argument("--price-years", type=int, default=6)
     daily.add_argument("--fundamental-years", type=int, default=6)
     daily.add_argument("--price-batch-size", type=int, default=100)
@@ -400,8 +406,14 @@ def build_parser() -> argparse.ArgumentParser:
     daily.add_argument("--max-results", type=int, default=10)
     daily.add_argument("--resume", action="store_true")
     daily.add_argument("--refresh-normalization", action="store_true")
+    daily.add_argument("--include-full-evaluations", action="store_true")
     daily.add_argument("--export-dir", default=None)
     daily.add_argument("--json", action="store_true")
+
+    maintenance = subparsers.add_parser("database-maintenance", help="Run safe SQLite maintenance checks")
+    maintenance.add_argument("--vacuum", action="store_true")
+    maintenance.add_argument("--minimum-free-space-mb", type=int, default=1024)
+    maintenance.add_argument("--json", action="store_true")
 
     compare_strategies = subparsers.add_parser("compare-strategies", help="Compare Graham, technical, and combined strategies")
     src = compare_strategies.add_mutually_exclusive_group()
@@ -540,6 +552,279 @@ def _print_db_status() -> None:
         print(f"  {ticker}: {row_count}")
     if not status["rows_by_ticker"]:
         print("  (none)")
+
+
+def _file_size(path: Path) -> int:
+    return path.stat().st_size if path.exists() else 0
+
+
+def _database_sidecar_paths(database_path: Path) -> List[Path]:
+    return [
+        database_path,
+        Path(str(database_path) + "-wal"),
+        Path(str(database_path) + "-shm"),
+        Path(str(database_path) + "-journal"),
+    ]
+
+
+def _bytes_to_mb(value: int) -> float:
+    return round(value / (1024 * 1024), 2)
+
+
+def _database_storage_snapshot(database_path: Path) -> Dict[str, Any]:
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(database_path.parent)
+    sidecars = {str(path): _file_size(path) for path in _database_sidecar_paths(database_path)}
+    return {
+        "database_path": str(database_path),
+        "database_size_bytes": sidecars[str(database_path)],
+        "database_size_mb": _bytes_to_mb(sidecars[str(database_path)]),
+        "sidecar_sizes_bytes": sidecars,
+        "sidecar_total_bytes": sum(sidecars.values()),
+        "sidecar_total_mb": _bytes_to_mb(sum(sidecars.values())),
+        "free_space_bytes": usage.free,
+        "free_space_mb": _bytes_to_mb(usage.free),
+    }
+
+
+def _print_storage_snapshot(label: str, snapshot: Dict[str, Any]) -> None:
+    print(f"{label} database_path={snapshot['database_path']}")
+    print(f"{label} database_size_mb={snapshot['database_size_mb']}")
+    print(f"{label} sqlite_files_total_mb={snapshot['sidecar_total_mb']}")
+    print(f"{label} free_space_mb={snapshot['free_space_mb']}")
+
+
+def _daily_preflight(database_path: Path, minimum_free_space_mb: int, json_output: bool = False) -> Optional[Dict[str, Any]]:
+    snapshot = _database_storage_snapshot(database_path)
+    threshold_bytes = int(minimum_free_space_mb) * 1024 * 1024
+    snapshot["minimum_free_space_mb"] = int(minimum_free_space_mb)
+    snapshot["safe_for_daily_writes"] = snapshot["free_space_bytes"] >= threshold_bytes
+    if not json_output:
+        _print_storage_snapshot("preflight", snapshot)
+        print(f"preflight minimum_free_space_mb={minimum_free_space_mb}")
+    if snapshot["safe_for_daily_writes"]:
+        return snapshot
+    message = (
+        "Skipped daily write-heavy stages before opening write transactions: "
+        f"free space {snapshot['free_space_mb']} MB is below configured minimum "
+        f"{minimum_free_space_mb} MB."
+    )
+    snapshot["skipped_stage"] = "daily preparation"
+    snapshot["message"] = message
+    if json_output:
+        print(json.dumps({"status": "blocked_low_disk", "storage": snapshot}, indent=2, sort_keys=True, default=str))
+    else:
+        print(message)
+    return None
+
+
+def _stage_count(stage_items: List[Dict[str, Any]], stage: str, status: str, reason_contains: Optional[str] = None) -> int:
+    total = 0
+    for item in stage_items:
+        if item.get("stage") != stage or item.get("status") != status:
+            continue
+        if reason_contains and reason_contains not in str(item.get("reason") or ""):
+            continue
+        total += 1
+    return total
+
+
+def _daily_operational_summary(
+    database_path: Path,
+    storage_before: Dict[str, Any],
+    storage_after: Dict[str, Any],
+    ticker_source: str,
+    tickers: List[str],
+    preparation: Dict[str, Any],
+    screen_payload: Dict[str, Any],
+    report: Dict[str, Any],
+    paths: Dict[str, str],
+    timings: Dict[str, float],
+    universe_result: Optional[Any],
+) -> Dict[str, Any]:
+    prep_summary = preparation["summary"]
+    stage_items = preparation.get("stage_items", [])
+    price_results = prep_summary.get("price_update_results", {})
+    sec_results = prep_summary.get("sec_update_results", {})
+    sec_refresh_diagnostics = [
+        item
+        for item in sec_results.get("diagnostics", [])
+        if item.get("decision")
+        in {
+            "requested_provider_refresh",
+            "skipped_duplicate_cik",
+            "skipped_provider_cooldown",
+            "skipped_provider_success_fresh",
+        }
+    ]
+    section_counts = {name: len(rows) for name, rows in report["sections"].items()}
+    report_summary = report.get("summary", {})
+    return {
+        "database_path": str(database_path),
+        "database_size_before_mb": storage_before["database_size_mb"],
+        "database_size_after_mb": storage_after["database_size_mb"],
+        "database_growth_mb": round(storage_after["database_size_mb"] - storage_before["database_size_mb"], 2),
+        "free_space_before_mb": storage_before["free_space_mb"],
+        "free_space_after_mb": storage_after["free_space_mb"],
+        "free_space_consumed_mb": round(storage_before["free_space_mb"] - storage_after["free_space_mb"], 2),
+        "ticker_source": ticker_source,
+        "requested_tickers": len(tickers),
+        "resolved_tickers": prep_summary.get("resolved_tickers"),
+        "price_tickers_already_current": price_results.get("already_current", 0) + _stage_count(stage_items, "PRICE_UPDATE_COMPLETE", "skipped"),
+        "price_tickers_updated": price_results.get("updated", prep_summary.get("price_update_succeeded", 0)),
+        "price_tickers_no_data": price_results.get("no_data", 0),
+        "price_update_failures": price_results.get("failed", prep_summary["failed_count_by_stage"].get("PRICE_UPDATE_COMPLETE", 0)),
+        "price_requests": price_results.get("requests", 0),
+        "price_cooldown_skipped": price_results.get("cooldown_skipped", 0),
+        "new_price_rows_written": price_results.get("rows_stored", 0),
+        "fundamentals_already_current": _stage_count(stage_items, "SEC_INGESTION_COMPLETE", "skipped", "already has SEC filings"),
+        "fundamentals_refreshed": prep_summary.get("sec_update_succeeded", 0),
+        "sec_requests": sec_results.get("requests", prep_summary.get("sec_update_attempted", 0)),
+        "unique_sec_ciks_considered": sec_results.get("unique_ciks_considered", 0),
+        "unique_sec_ciks_requested": sec_results.get("unique_ciks_requested", 0),
+        "unique_sec_ciks_refreshed": sec_results.get("unique_ciks_refreshed", 0),
+        "sec_success_records_written": sec_results.get("success_records_written", 0),
+        "sec_success_freshness_skipped": sec_results.get("success_freshness_skipped", 0),
+        "sec_success_missing_status": sec_results.get("success_missing_status", 0),
+        "sec_success_status_stale": sec_results.get("success_status_stale", 0),
+        "sec_normalization_incomplete_after_success": sec_results.get("normalization_incomplete_after_success", 0),
+        "duplicate_sec_requests_avoided": sec_results.get("duplicate_cik_skipped", 0),
+        "sec_cooldown_skipped": sec_results.get("cooldown_skipped", 0),
+        "sec_refresh_diagnostics": sec_refresh_diagnostics,
+        "provider_failures_recorded": sec_results.get("cooldown_failures_recorded", 0),
+        "normalization_updates": _stage_count(stage_items, "NORMALIZATION_COMPLETE", "succeeded"),
+        "graham_evaluable_count": screen_payload["coverage_summary"]["graham_evaluable_tickers"],
+        "technical_evaluable_count": screen_payload["coverage_summary"]["technical_evaluable_tickers"],
+        "combined_evaluable_count": screen_payload["coverage_summary"]["combined_evaluable_tickers"],
+        "graham_qualified_count": report_summary.get("graham_qualified_count", screen_payload["coverage_summary"].get("graham_qualified_tickers", 0)),
+        "graham_watchlist_count": report_summary.get("graham_watchlist_count", 0),
+        "graham_rows_displayed": report_summary.get("graham_rows_displayed", section_counts.get("GRAHAM WATCHLIST", 0)),
+        "technical_qualified_count": report_summary.get("technical_qualified_count", screen_payload["coverage_summary"].get("technical_qualified_tickers", 0)),
+        "technical_watchlist_count": report_summary.get("technical_watchlist_count", 0),
+        "technical_rows_displayed": report_summary.get("technical_rows_displayed", section_counts.get("TECHNICAL WATCHLIST", 0)),
+        "combined_qualified_count": report_summary.get("combined_qualified_count", screen_payload["coverage_summary"].get("combined_qualified_tickers", 0)),
+        "combined_watchlist_count": report_summary.get("combined_watchlist_count", 0),
+        "combined_rows_displayed": report_summary.get("combined_rows_displayed", section_counts.get("COMBINED CANDIDATES", 0) + section_counts.get("COMBINED WATCHLIST", 0)),
+        "section_counts": section_counts,
+        "failures_by_reason": prep_summary.get("failures_by_reason", {}),
+        "failures_by_retry_classification": prep_summary.get("failures_by_retry_classification", {}),
+        "report_paths": paths,
+        "timings": timings,
+        "universe_refresh": universe_result.__dict__ if universe_result else {"skipped": True},
+    }
+
+
+def _compact_preparation_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    compact = dict(summary)
+    price_results = dict(compact.get("price_update_results") or {})
+    price_results.pop("results", None)
+    compact["price_update_results"] = price_results
+    sec_results = dict(compact.get("sec_update_results") or {})
+    sec_results.pop("diagnostics", None)
+    compact["sec_update_results"] = sec_results
+    return compact
+
+
+def _print_daily_operational_summary(summary: Dict[str, Any]) -> None:
+    print("Daily operational summary:")
+    keys = [
+        "database_path",
+        "database_size_before_mb",
+        "database_size_after_mb",
+        "database_growth_mb",
+        "free_space_before_mb",
+        "free_space_after_mb",
+        "free_space_consumed_mb",
+        "requested_tickers",
+        "resolved_tickers",
+        "price_tickers_already_current",
+        "price_tickers_updated",
+        "new_price_rows_written",
+        "price_update_failures",
+        "price_tickers_no_data",
+        "price_requests",
+        "price_cooldown_skipped",
+        "fundamentals_already_current",
+        "fundamentals_refreshed",
+        "sec_requests",
+        "unique_sec_ciks_considered",
+        "unique_sec_ciks_requested",
+        "unique_sec_ciks_refreshed",
+        "sec_success_records_written",
+        "sec_success_freshness_skipped",
+        "sec_success_missing_status",
+        "sec_success_status_stale",
+        "sec_normalization_incomplete_after_success",
+        "duplicate_sec_requests_avoided",
+        "sec_cooldown_skipped",
+        "normalization_updates",
+        "graham_evaluable_count",
+        "technical_evaluable_count",
+        "combined_evaluable_count",
+        "graham_qualified_count",
+        "graham_watchlist_count",
+        "graham_rows_displayed",
+        "technical_qualified_count",
+        "technical_watchlist_count",
+        "technical_rows_displayed",
+        "combined_qualified_count",
+        "combined_watchlist_count",
+        "combined_rows_displayed",
+    ]
+    for key in keys:
+        print(f"{key}={summary.get(key)}")
+    print(f"failures_by_reason={summary.get('failures_by_reason')}")
+    print(f"failures_by_retry_classification={summary.get('failures_by_retry_classification')}")
+    print(f"report_paths={summary.get('report_paths')}")
+    print(f"timings={summary.get('timings')}")
+
+
+def _database_maintenance_command(args: argparse.Namespace) -> None:
+    database_path = resolve_database_path(DATABASE_PATH)
+    before = _database_storage_snapshot(database_path)
+    checkpoint = None
+    optimize = None
+    integrity = None
+    vacuum = {"requested": bool(args.vacuum), "performed": False, "reason": ""}
+    with get_connection(database_path) as connection:
+        checkpoint_row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        checkpoint = list(checkpoint_row) if checkpoint_row is not None else []
+        optimize_rows = connection.execute("PRAGMA optimize").fetchall()
+        optimize = [tuple(row) for row in optimize_rows]
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+    if args.vacuum:
+        after_checkpoint = _database_storage_snapshot(database_path)
+        required_bytes = after_checkpoint["database_size_bytes"] + (int(args.minimum_free_space_mb) * 1024 * 1024)
+        if after_checkpoint["free_space_bytes"] < required_bytes:
+            vacuum["reason"] = "skipped; free space is below database size plus configured safety threshold"
+        else:
+            with sqlite3.connect(str(database_path)) as connection:
+                connection.execute("VACUUM")
+            vacuum["performed"] = True
+    after = _database_storage_snapshot(database_path)
+    payload = {
+        "database_path": str(database_path),
+        "before": before,
+        "after": after,
+        "wal_checkpoint": checkpoint,
+        "optimize": optimize,
+        "integrity_check": integrity,
+        "vacuum": vacuum,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+    print(f"Database path: {payload['database_path']}")
+    print(f"Database size before MB: {before['database_size_mb']}")
+    print(f"Database size after MB: {after['database_size_mb']}")
+    print(f"SQLite side-file total before MB: {before['sidecar_total_mb']}")
+    print(f"SQLite side-file total after MB: {after['sidecar_total_mb']}")
+    print(f"Free space before MB: {before['free_space_mb']}")
+    print(f"Free space after MB: {after['free_space_mb']}")
+    print(f"WAL checkpoint: {checkpoint}")
+    print(f"SQLite optimize: {optimize}")
+    print(f"Integrity check: {integrity}")
+    print(f"VACUUM: {vacuum}")
 
 
 def _print_backtest_result(result) -> None:
@@ -1150,7 +1435,7 @@ def _combined_screen_payload(args: argparse.Namespace, tickers: List[str]) -> di
     if sort_by and rows and sort_by in rows[0]:
         rows = sorted(rows, key=lambda row: (row.get(sort_by) is None, row.get(sort_by), row["ticker"]), reverse=descending)
     summary = combined_coverage_summary(rows)
-    readiness = build_readiness_report(tickers, args.as_of, price_years=6)
+    readiness = build_readiness_report(tickers, args.as_of, price_years=getattr(args, "price_years", 6))
     summary.update(
         {
             "price_ready_tickers": readiness["summary"]["price_ready"],
@@ -1205,12 +1490,19 @@ def _run_combined_backtest_command(args: argparse.Namespace) -> None:
 
 
 def _run_daily_screen_command(args: argparse.Namespace) -> None:
-    database_path = str(resolve_database_path(DATABASE_PATH))
+    database_path = resolve_database_path(DATABASE_PATH)
     as_of = args.as_of or date.today().isoformat()
+    args.as_of = as_of
     export_dir = args.export_dir or "outputs/daily"
     timings = {}
     started = time.perf_counter()
-    if not args.skip_universe_refresh:
+    storage_before = _daily_preflight(database_path, args.minimum_free_space_mb, json_output=args.json)
+    if storage_before is None:
+        return
+    initialize_database()
+
+    should_refresh_universe = bool(args.refresh_universe) and not bool(args.skip_universe_refresh)
+    if should_refresh_universe:
         t0 = time.perf_counter()
         initialize_database()
         universe_result = build_universe_from_sec_map()
@@ -1238,6 +1530,7 @@ def _run_daily_screen_command(args: argparse.Namespace) -> None:
         fundamental_batch_size=args.fundamental_batch_size,
         skip_fundamentals=args.skip_fundamentals,
         fundamental_worker=update_fundamentals_for_ticker,
+        force_provider_refresh=args.force_provider_refresh,
     )
     timings["preparation_seconds"] = round(time.perf_counter() - t0, 3)
 
@@ -1257,33 +1550,43 @@ def _run_daily_screen_command(args: argparse.Namespace) -> None:
         max_results=args.max_results,
     )
     paths = export_daily_opportunities(report, export_dir)
+    if args.include_full_evaluations:
+        full_path = Path(export_dir) / as_of / "combined-full-evaluations.json"
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(json.dumps(screen_payload["rows"], indent=2, sort_keys=True, default=str), encoding="utf-8")
+        paths["full_evaluations_json"] = str(full_path)
     timings["report_generation_seconds"] = round(time.perf_counter() - t0, 3)
     timings["total_seconds"] = round(time.perf_counter() - started, 3)
-
-    summary = {
-        "database_path": database_path,
-        "as_of": as_of,
-        "ticker_source": ticker_source,
-        "requested": len(tickers),
-        "universe": production_universe_summary(),
-        "universe_refresh": universe_result.__dict__ if universe_result else {"skipped": True},
-        "preparation": preparation["summary"],
-        "screening": screen_payload["coverage_summary"],
-        "daily_report": paths,
-        "section_counts": {name: len(rows) for name, rows in report["sections"].items()},
-        "timings": timings,
-    }
+    storage_after = _database_storage_snapshot(database_path)
+    summary = _daily_operational_summary(
+        database_path,
+        storage_before,
+        storage_after,
+        ticker_source,
+        tickers,
+        preparation,
+        screen_payload,
+        report,
+        paths,
+        timings,
+        universe_result,
+    )
+    summary.update(
+        {
+            "as_of": as_of,
+            "universe": production_universe_summary(),
+            "preparation": _compact_preparation_summary(preparation["summary"]),
+            "screening": screen_payload["coverage_summary"],
+        }
+    )
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True, default=str))
         return
-    print(f"Database path: {database_path}")
-    print(f"as_of={as_of} requested={summary['requested']}")
+    print(f"as_of={as_of} ticker_source={ticker_source}")
+    print(f"universe_refresh={summary['universe_refresh']}")
     print(f"price_ready={summary['screening']['price_ready_tickers']} graham_evaluable={summary['screening']['graham_evaluable_tickers']} technical_evaluable={summary['screening']['technical_evaluable_tickers']} combined_evaluable={summary['screening']['combined_evaluable_tickers']}")
     print(f"graham_qualified={summary['screening']['graham_qualified_tickers']} technical_qualified={summary['screening']['technical_qualified_tickers']} combined_qualified={summary['screening']['combined_qualified_tickers']}")
-    print(f"failures_by_reason={summary['preparation'].get('failures_by_reason')}")
-    print(f"daily_report_csv={paths['csv']}")
-    print(f"daily_report_json={paths['json']}")
-    print(f"timings={timings}")
+    _print_daily_operational_summary(summary)
 
 
 def _compare_strategies_command(args: argparse.Namespace) -> None:
@@ -1549,6 +1852,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         _run_combined_backtest_command(args)
     elif args.command == "run-daily-screen":
         _run_daily_screen_command(args)
+    elif args.command == "database-maintenance":
+        _database_maintenance_command(args)
     elif args.command == "compare-strategies":
         _compare_strategies_command(args)
     elif args.command == "validate-strategy":

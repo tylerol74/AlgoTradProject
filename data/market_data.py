@@ -279,6 +279,8 @@ def update_ticker_prices(
 
         upsert_security(normalized, security_type="Equity", is_active=True)
         rows = download_price_history(normalized, download_start, effective_end_date)
+        if latest_date:
+            rows = [row for row in rows if _parse_iso_date(row["trade_date"]) > _parse_iso_date(latest_date)]
         summary["rows_downloaded"] = len(rows)
 
         if not rows:
@@ -307,9 +309,10 @@ def update_price_universe(
     effective_end_date = end_date or _expected_latest_trade_date().isoformat()
     pending: List[Dict[str, Any]] = []
     for ticker in normalized_tickers:
-        summary: Dict[str, Any] = {"ticker": ticker, "status": "failed", "rows_downloaded": 0, "rows_stored": 0, "start_date": None, "end_date": end_date, "error": None}
+        summary: Dict[str, Any] = {"ticker": ticker, "status": "failed", "rows_downloaded": 0, "rows_stored": 0, "start_date": None, "end_date": end_date, "error": None, "latest_date": None}
         try:
             latest_date = get_latest_price_date(ticker)
+            summary["latest_date"] = latest_date
             if latest_date and _parse_iso_date(latest_date) >= _parse_iso_date(effective_end_date):
                 summary["status"] = "already_current"
                 summaries.append(summary)
@@ -341,6 +344,9 @@ def update_price_universe(
             downloaded = download_price_history_batch(batch_tickers, start_key, effective_end_date)
             for item in batch:
                 rows = downloaded.get(item["ticker"], [])
+                if item.get("latest_date"):
+                    latest = _parse_iso_date(item["latest_date"])
+                    rows = [row for row in rows if _parse_iso_date(row["trade_date"]) > latest]
                 item["rows_downloaded"] = len(rows)
                 if rows:
                     item["rows_stored"] = upsert_daily_prices(rows)

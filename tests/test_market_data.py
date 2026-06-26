@@ -5,6 +5,7 @@ import pytest
 
 import database.connection as connection_module
 from data import market_data
+from data.readiness import build_readiness_report
 from data.market_data import (
     download_price_history,
     normalize_ticker,
@@ -252,4 +253,68 @@ def test_price_history_retrieval_from_market_data_database(temp_database, monkey
 
     assert len(rows) == 1
     assert rows[0]["trade_date"] == "2024-01-03"
+
+
+def test_invalid_downloaded_row_does_not_rollback_valid_ticker_updates(temp_database, monkeypatch):
+    def fake_batch(tickers, start_date, end_date=None):
+        return {
+            "GOOD": [
+                {
+                    "ticker": "GOOD",
+                    "trade_date": "2024-01-02",
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "adjusted_close": 10.5,
+                    "volume": 1000,
+                    "downloaded_at": "now",
+                }
+            ],
+            "BAD": [],
+        }
+
+    monkeypatch.setattr(market_data, "download_price_history_batch", fake_batch)
+
+    summary = update_price_universe(["GOOD", "BAD"], start_date="2024-01-01", end_date="2024-01-02")
+
+    assert summary["updated"] == 1
+    assert summary["no_data"] == 1
+    assert count_price_rows("GOOD") == 1
+    assert count_price_rows("BAD") == 0
+
+
+def test_current_day_readiness_uses_latest_completed_bar(temp_database):
+    today = date.today()
+    completed = today
+    while completed.weekday() >= 5:
+        completed = completed.fromordinal(completed.toordinal() - 1)
+    if completed == today:
+        completed = completed.fromordinal(completed.toordinal() - 1)
+        while completed.weekday() >= 5:
+            completed = completed.fromordinal(completed.toordinal() - 1)
+
+    rows = []
+    for index in range(22):
+        trade_date = completed.fromordinal(completed.toordinal() - (21 - index)).isoformat()
+        rows.append(
+            {
+                "ticker": "AAPL",
+                "trade_date": trade_date,
+                "open": 100.0,
+                "high": 102.0,
+                "low": 99.0,
+                "close": 101.0,
+                "adjusted_close": 101.0,
+                "volume": 1000,
+                "downloaded_at": "now",
+            }
+        )
+    upsert_security("AAPL")
+    upsert_daily_prices(rows)
+
+    report = build_readiness_report(["AAPL"], today.isoformat(), price_years=0)
+
+    assert report["rows"][0]["price_ready"]
+    assert report["rows"][0]["technical_evaluable"]
 

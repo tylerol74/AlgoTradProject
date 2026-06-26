@@ -667,6 +667,63 @@ Inspect failures in the preparation export named `*-failures.csv`. Legitimate SE
 
 Known limitations: the workflow cannot make unsupported securities supportable, cannot fabricate issuer facts that SEC does not provide, and cannot prove future profitability. Full-universe preparation can require substantial external API time and should be run in bounded batches, not as an uncontrolled 10,000-security job.
 
+## Daily Use on a Local Machine
+
+Daily screening does not require a six-year backtest. Long-range backtesting is currently deferred; use the daily command first to observe whether the stored Graham, technical, and combined criteria produce useful ideas over several trading days.
+
+Initial one-time setup:
+
+```powershell
+$env:SEC_USER_AGENT = "AlgoTradProject/0.1 your.email@example.com"
+python main.py export-eligible-universe --output outputs/universe/eligible-common-stocks.txt
+python main.py sample-universe --eligible-only --count 500 --seed 42 --export-dir outputs/universe
+```
+
+The sample command writes `outputs/universe/eligible-universe-500.txt` by default. To use the daily workflow path from this phase, create or refresh the working sample file with PowerShell:
+
+```powershell
+Get-Content outputs/universe/eligible-universe-500.txt | Set-Content outputs/universe/eligible-common-stocks-500.txt
+```
+
+Daily use:
+
+```powershell
+python main.py run-daily-screen --ticker-file outputs/universe/eligible-common-stocks-500.txt --max-results 20 --resume
+```
+
+When `--ticker-file` is supplied, daily screening uses that file and does not refresh or rewrite the full security universe unless `--refresh-universe` is explicitly supplied. The command updates only missing incremental price rows, missing or stale fundamentals under the existing freshness checks, and incomplete normalization. Same-day reruns are safe: already-current prices and fresh fundamentals are skipped, and the compact report for the day is overwritten instead of creating duplicate full-evaluation exports.
+
+The default output is the compact daily report:
+
+```text
+outputs/daily/YYYY-MM-DD/daily-opportunities.json
+outputs/daily/YYYY-MM-DD/daily-opportunities.csv
+```
+
+The report contains only top combined candidates, top Graham watchlist names, and top technical watchlist names, respecting `--max-results`. Use `--include-full-evaluations` only when you intentionally want the larger stored-data evaluation JSON for debugging.
+
+`COMBINED CANDIDATES` contains only rows that pass the combined strategy criteria. When no rows qualify, the section is empty and the highest-scoring nonqualified rows appear under `COMBINED WATCHLIST` instead. The daily summary reports qualified counts, watchlist counts, and displayed counts separately for combined, Graham, and technical sections.
+
+Provider failures are classified as retryable now, retryable next trading day, retryable after the fundamentals refresh interval, permanent or unsupported, or manual review required. Confirmed yfinance no-data and SEC 404 results are stored as cooldowns so same-day reruns do not keep asking for the same known failures. Use `--force-provider-refresh` when you intentionally want to retry cooldown-protected provider requests.
+
+A zero combined-candidate count is not automatically a data failure. Check the summary counts: if Graham-evaluable, technical-evaluable, and combined-evaluable counts are nonzero, then the evaluated names simply did not pass the current combined criteria. If evaluable counts are low, inspect `failures_by_reason` for provider no-data, unsupported tickers, stale data, missing fundamentals, insufficient history, or software errors.
+
+The command checks free disk space on the drive containing `data/algotrad.db` before write-heavy work. The default threshold is 1024 MB and can be changed with:
+
+```powershell
+python main.py run-daily-screen --ticker-file outputs/universe/eligible-common-stocks-500.txt --max-results 20 --resume --minimum-free-space-mb 2048
+```
+
+If free space is below the configured threshold, the command stops before daily preparation writes and prints the database path, database size, current free space, and the skipped stage.
+
+Maintenance:
+
+```powershell
+python main.py database-maintenance
+```
+
+This performs a WAL checkpoint, SQLite optimize, integrity check, database size report, side-file size report, and free-space report. It does not delete market data, remove fundamentals, or vacuum automatically. `--vacuum` is available only as an explicit operator action and is skipped when free space is not high enough for a safe copy of the database plus the configured free-space threshold.
+
 
 
 
